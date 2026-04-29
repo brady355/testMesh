@@ -590,22 +590,88 @@ def wait_for_funds(*, timeout: int = 3600) -> dict[str, Any]:
     return wait_for("wallet funds", predicate, timeout=timeout, interval=10.0)
 
 
-def wait_for_cln_sync(*, timeout: int = 3600, max_lag: int = 2) -> dict[str, Any]:
-    def predicate() -> dict[str, Any] | None:
-        info = cln("getinfo")
-        blockheight = int(info.get("blockheight") or 0)
-        chain_height = 0
+def _sync_progress_line(snapshot: dict[str, Any]) -> str:
+    blockheight = int(snapshot["blockheight"])
+    chain_height = int(snapshot["chain_height"])
+    headers = int(snapshot.get("headers") or chain_height)
+    target = max(chain_height, headers, blockheight, 1)
+    lag = int(snapshot["lag"])
+    percent = min(100.0, (blockheight / target) * 100)
+    host = local_mesh_name()
+    parts = [
+        f"[wait-sync] {host}: CLN {blockheight}/{target} blocks",
+        f"{percent:.1f}%",
+        f"lag {lag}",
+    ]
+    if headers != chain_height:
+        parts.append(f"bitcoind {chain_height}/{headers}")
+    if snapshot.get("initialblockdownload"):
+        parts.append("bitcoind initial block download")
+    if snapshot.get("warnings"):
+        parts.append("; ".join(snapshot["warnings"]))
+    return " | ".join(parts)
+
+
+def cln_sync_snapshot() -> dict[str, Any]:
+    info = cln("getinfo")
+    blockheight = int(info.get("blockheight") or 0)
+    chain_height = blockheight
+    headers = blockheight
+    initialblockdownload = False
+    try:
+        chain = bitcoin("getblockchaininfo")
+        chain_height = int(chain.get("blocks") or chain_height)
+        headers = int(chain.get("headers") or chain_height)
+        initialblockdownload = bool(chain.get("initialblockdownload"))
+    except Exception:
         try:
             chain_height = int(bitcoin("getblockcount", capture_json=False))
+            headers = chain_height
         except Exception:
-            chain_height = blockheight
-        warning_keys = [key for key in info if key.startswith("warning_")]
-        lag = chain_height - blockheight
-        if lag <= max_lag and "warning_lightningd_sync" not in warning_keys:
-            return {"cln": info, "chain_height": chain_height, "lag": lag}
-        return None
+            pass
+    warning_keys = [key for key in info if key.startswith("warning_")]
+    warnings = [str(info[key]) for key in warning_keys if info.get(key)]
+    lag = chain_height - blockheight
+    return {
+        "cln": info,
+        "chain_height": chain_height,
+        "headers": headers,
+        "initialblockdownload": initialblockdownload,
+        "blockheight": blockheight,
+        "lag": lag,
+        "warning_keys": warning_keys,
+        "warnings": warnings,
+    }
 
-    return wait_for("CLN to catch up to Bitcoin Core", predicate, timeout=timeout, interval=10.0)
+
+def wait_for_cln_sync(*, timeout: int = 3600, max_lag: int = 2, progress: bool = False) -> dict[str, Any]:
+    deadline = None if timeout <= 0 else time.time() + timeout
+    last_error: Exception | None = None
+
+    while deadline is None or time.time() < deadline:
+        try:
+            snapshot = cln_sync_snapshot()
+            line = _sync_progress_line(snapshot)
+            if progress:
+                print(line, flush=True)
+            if snapshot["lag"] <= max_lag and "warning_lightningd_sync" not in snapshot["warning_keys"]:
+                if progress:
+                    print(f"[wait-sync] {local_mesh_name()}: CLN is synced", flush=True)
+                return {
+                    "cln": snapshot["cln"],
+                    "chain_height": snapshot["chain_height"],
+                    "headers": snapshot["headers"],
+                    "lag": snapshot["lag"],
+                }
+        except Exception as exc:  # pragma: no cover - runtime-only helper
+            last_error = exc
+            if progress:
+                print(f"[wait-sync] {local_mesh_name()}: waiting for CLN/Bitcoin RPC: {exc}", flush=True)
+        time.sleep(10.0)
+
+    if last_error:
+        raise TimeoutError(f"timed out waiting for CLN to catch up to Bitcoin Core: {last_error}") from last_error
+    raise TimeoutError("timed out waiting for CLN to catch up to Bitcoin Core")
 
 
 def print_json(payload: Any) -> None:
@@ -636,7 +702,7 @@ def _cmd_wait_funds(args: argparse.Namespace) -> None:
 
 
 def _cmd_wait_sync(args: argparse.Namespace) -> None:
-    print_json(wait_for_cln_sync(timeout=args.timeout, max_lag=args.max_lag))
+    print_json(wait_for_cln_sync(timeout=args.timeout, max_lag=args.max_lag, progress=args.progress))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -651,8 +717,9 @@ def build_parser() -> argparse.ArgumentParser:
     wait_funds.set_defaults(func=_cmd_wait_funds)
 
     wait_sync = subparsers.add_parser("wait-sync", help="Wait until local CLN is caught up to Bitcoin Core.")
-    wait_sync.add_argument("--timeout", type=int, default=3600)
+    wait_sync.add_argument("--timeout", type=int, default=3600, help="Seconds to wait; 0 waits indefinitely.")
     wait_sync.add_argument("--max-lag", type=int, default=2)
+    wait_sync.add_argument("--progress", action="store_true", help="Print CLN sync progress while waiting.")
     wait_sync.set_defaults(func=_cmd_wait_sync)
 
     return parser

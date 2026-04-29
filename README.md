@@ -83,7 +83,13 @@ After every Pi has joined the mesh, run one command on the gateway:
 sudo bash /opt/offlinemesh/setup_gateway.sh
 ```
 
-That command installs the gateway stack, discovers mesh neighbors, assigns logical names such as `node01`, installs newly discovered node Pis, and verifies the result. To intentionally reinstall nodes already seen by the gateway:
+That command installs the gateway stack, discovers mesh neighbors, assigns logical names such as `node01`, installs newly discovered node Pis, and verifies the result. During verification, each Pi waits for Core Lightning to catch up to Bitcoin Core and prints live progress like:
+
+```text
+[wait-sync] gateway01: CLN 60174/133010 blocks | 45.2% | lag 72836 | Still loading latest blocks from bitcoind.
+```
+
+On a first clean install this can take a while. Leave it running while the CLN block number climbs; verification continues once CLN is within a couple of blocks of Bitcoin Core and the sync warning clears. To intentionally reinstall nodes already seen by the gateway:
 
 ```bash
 sudo bash /opt/offlinemesh/setup_gateway.sh --force
@@ -252,6 +258,8 @@ Then run:
 sudo python3 /opt/offlinemesh/scripts/gateway_orchestrator.py verify
 sudo python3 /opt/offlinemesh/scripts/gateway_orchestrator.py demo --source node02 --target node01
 ```
+
+The `verify` command also shows live `[wait-sync]` progress for the gateway and each node if CLN is still scanning blocks. A node does not run its own `bitcoind`; its CLN sync progress is measured against the gateway Bitcoin RPC over `bat0`.
 
 Successful mesh-only verification means:
 

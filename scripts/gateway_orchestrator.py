@@ -212,18 +212,40 @@ class Gateway:
             scp = ["sshpass", "-p", self.password] + scp
         return scp
 
-    def ssh(self, target: str, command: str, *, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-        return run(self.ssh_base(target) + [command], check=check, timeout=timeout)
+    def ssh(
+        self,
+        target: str,
+        command: str,
+        *,
+        check: bool = True,
+        timeout: int | None = None,
+        capture: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        return run(self.ssh_base(target) + [command], check=check, timeout=timeout, capture=capture)
 
-    def sudo(self, target: str, command: str, *, check: bool = True, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    def sudo(
+        self,
+        target: str,
+        command: str,
+        *,
+        check: bool = True,
+        timeout: int | None = None,
+        capture: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
         quoted = shlex.quote(command)
-        remote = f"printf '%s\\n' {shlex.quote(self.password)} | sudo -S bash -lc {quoted}"
-        return self.ssh(target, remote, check=check, timeout=timeout)
+        remote = f"printf '%s\\n' {shlex.quote(self.password)} | sudo -S -p '' bash -lc {quoted}"
+        return self.ssh(target, remote, check=check, timeout=timeout, capture=capture)
 
-    def local_sudo(self, command: str, *, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
+    def local_sudo(
+        self,
+        command: str,
+        *,
+        timeout: int | None = None,
+        capture: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
         if hasattr(os, "geteuid") and os.geteuid() == 0:
-            return run(["bash", "-lc", command], timeout=timeout)
-        return run(["sudo", "bash", "-lc", command], timeout=timeout)
+            return run(["bash", "-lc", command], timeout=timeout, capture=capture)
+        return run(["sudo", "bash", "-lc", command], timeout=timeout, capture=capture)
 
     def record_history(self, event: str, payload: dict[str, Any]) -> None:
         self.state.setdefault("history", []).append({"event": event, "at": now_iso(), **payload})
@@ -543,12 +565,12 @@ class Gateway:
 
     def verify(self, nodes: list[Node]) -> None:
         log("verifying gateway")
-        self.local_sudo(f"bash {shlex.quote(str(ROOT / 'scripts' / 'verify_cycle.sh'))}", timeout=600)
+        self.local_sudo(f"bash {shlex.quote(str(ROOT / 'scripts' / 'verify_cycle.sh'))}", capture=False)
         for node in nodes:
             if not node.ssh_ok:
                 continue
             log(f"verifying {node.hostname}")
-            self.sudo(node.ip, f"bash {REMOTE_ROOT}/scripts/verify_cycle.sh", timeout=600)
+            self.sudo(node.ip, f"bash {REMOTE_ROOT}/scripts/verify_cycle.sh", capture=False)
 
     def funding_request(self, nodes: list[Node], amount_sat: int, names: list[str]) -> dict[str, Any]:
         selected = [node for node in nodes if not names or node.hostname in names]

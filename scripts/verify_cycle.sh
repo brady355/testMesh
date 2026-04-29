@@ -13,6 +13,7 @@ ROLE="${OFFLINEMESH_ROLE:-node}"
 BAT_IFACE="${OFFLINEMESH_BAT_IFACE:-bat0}"
 GATEWAY_IP="${OFFLINEMESH_GATEWAY_IP:-192.168.199.1}"
 READY_TIMEOUT=300
+SYNC_TIMEOUT="${OFFLINEMESH_SYNC_TIMEOUT:-0}"
 WAIT_FUNDS=0
 FUNDS_TIMEOUT=3600
 PEER=""
@@ -29,6 +30,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --ready-timeout)
       READY_TIMEOUT="$2"
+      shift 2
+      ;;
+    --sync-timeout)
+      SYNC_TIMEOUT="$2"
       shift 2
       ;;
     --wait-funds)
@@ -134,7 +139,7 @@ if [[ "$WATCHTOWER_ENABLED" == "1" && "$SKIP_WATCHTOWER" -ne 1 ]]; then
 fi
 
 python3 "${ROOT_DIR}/scripts/lnmesh_common.py" local-info
-python3 "${ROOT_DIR}/scripts/lnmesh_common.py" wait-sync --timeout "$READY_TIMEOUT"
+python3 "${ROOT_DIR}/scripts/lnmesh_common.py" wait-sync --timeout "$SYNC_TIMEOUT" --progress
 
 if [[ "$WAIT_FUNDS" -eq 1 ]]; then
   python3 "${ROOT_DIR}/scripts/lnmesh_common.py" wait-funds --timeout "$FUNDS_TIMEOUT"
