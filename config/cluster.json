@@ -1,0 +1,78 @@
+{
+  "mesh": {
+    "profile": "mesh-a",
+    "essid": "pi-mesh",
+    "channel": 1,
+    "wifi_freq": 2412,
+    "bat_iface": "bat0",
+    "wifi_iface": "wlan0",
+    "bat_mtu": 1450,
+    "subnet": "192.168.199.0/24",
+    "gateway_ip": "192.168.199.1",
+    "dhcp_start": "192.168.199.2",
+    "dhcp_end": "192.168.199.99",
+    "domain": "local.test",
+    "gateway_name": "gateway01",
+    "node_name_prefix": "node",
+    "node_name_digits": 2,
+    "profiles": {
+      "mesh-a": {
+        "essid": "pi-mesh-a",
+        "channel": 1,
+        "wifi_freq": 2412,
+        "subnet": "192.168.199.0/24",
+        "gateway_ip": "192.168.199.1",
+        "dhcp_start": "192.168.199.2",
+        "dhcp_end": "192.168.199.99",
+        "domain": "local.test"
+      },
+      "mesh-b": {
+        "essid": "pi-mesh-b",
+        "channel": 6,
+        "wifi_freq": 2437,
+        "subnet": "192.168.209.0/24",
+        "gateway_ip": "192.168.209.1",
+        "dhcp_start": "192.168.209.2",
+        "dhcp_end": "192.168.209.99",
+        "domain": "mesh-b.test"
+      }
+    }
+  },
+  "bitcoin": {
+    "network": "testnet4",
+    "version": "31.0",
+    "rpc_host": "192.168.199.1",
+    "rpc_port": 48332,
+    "rpc_user": "offlinemesh",
+    "rpc_password_file": "/etc/offlinemesh/bitcoin-rpc-password",
+    "datadir": "/home/meshlink/.bitcoin"
+  },
+  "lightning": {
+    "network": "testnet4",
+    "bind_port": 19735,
+    "source_cache_port": 19737,
+    "use_gateway_bitcoin": true,
+    "cln_version_tag": "v25.12.1",
+    "allow_network_source": true
+  },
+  "watchtower": {
+    "enabled": true,
+    "provider": "teos",
+    "network": "testnet4",
+    "api_host": "192.168.199.1",
+    "api_port": 9814,
+    "rpc_host": "127.0.0.1",
+    "rpc_port": 8814,
+    "btc_rpc_host": "127.0.0.1",
+    "btc_rpc_port": 48332,
+    "source_cache_name": "rust-teos.tar.gz",
+    "source_ref": "master",
+    "repo_url": "https://github.com/talaia-labs/rust-teos.git"
+  },
+  "hosts": {
+    "gateway01": {
+      "role": "gateway",
+      "mesh_ip": "192.168.199.1"
+    }
+  }
+}
