@@ -38,14 +38,9 @@ EOF
 }
 
 if [[ -z "$ROLE" ]]; then
-  case "$HOST_SHORT" in
-    gateway*) ROLE="gateway" ;;
-    node*) ROLE="node" ;;
-    *)
-      echo "Could not infer role from hostname '${HOST_SHORT}'. Pass gateway or node." >&2
-      exit 2
-      ;;
-  esac
+  usage >&2
+  echo "Pass gateway or node explicitly; hostnames do not choose roles." >&2
+  exit 2
 fi
 
 if [[ "$ROLE" != "gateway" && "$ROLE" != "node" ]]; then
@@ -112,13 +107,12 @@ PY
 }
 
 MESH_PROFILE="$(cluster_value mesh.profile mesh-a)"
-GATEWAY_NAME="$(cluster_value mesh.gateway_name gateway01)"
 NODE_ID="${OFFLINEMESH_NODE_ID:-}"
 if [[ -z "$NODE_ID" && -f "$ENV_FILE" ]]; then
   NODE_ID="$(awk -F= '$1 == "OFFLINEMESH_NODE_ID" {print $2; exit}' "$ENV_FILE" 2>/dev/null || true)"
 fi
 if [[ -z "$NODE_ID" && "$ROLE" == "gateway" ]]; then
-  NODE_ID="$GATEWAY_NAME"
+  NODE_ID="$HOST_SHORT"
 fi
 ESSID="$(cluster_value mesh.essid pi-mesh)"
 CHANNEL="$(cluster_value mesh.channel 1)"

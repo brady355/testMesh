@@ -7,7 +7,9 @@ ENV_FILE="${OFFLINEMESH_ENV_FILE:-/etc/offlinemesh/env}"
 
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
+  set -a
   source "$ENV_FILE"
+  set +a
 fi
 
 HOST_SHORT="$(hostname -s 2>/dev/null || echo unknown)"

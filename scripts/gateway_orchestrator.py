@@ -42,6 +42,11 @@ def log(message: str) -> None:
     print(f"[gateway] {message}", flush=True)
 
 
+def short_hostname(default: str = "") -> str:
+    host = socket.gethostname().split(".")[0].strip()
+    return host or default
+
+
 def run(
     cmd: list[str],
     *,
@@ -171,9 +176,9 @@ class Gateway:
         self.user = args.user
         self.password = args.password
         self.bat_iface = self.mesh.get("bat_iface", "bat0")
-        self.gateway_name = self.mesh.get("gateway_name", "gateway01")
-        self.node_name_prefix = self.mesh.get("node_name_prefix", "node")
-        self.node_name_digits = int(self.mesh.get("node_name_digits", 2))
+        self.configured_gateway_name = self.mesh.get("gateway_name", "gateway01")
+        self.gateway_name = short_hostname(self.configured_gateway_name)
+        self.gateway_cln_id = ""
         self.gateway_ip = self.mesh.get("gateway_ip", "192.168.199.1")
         self.domain = self.mesh.get("domain", "local.test")
         self.state = load_json(STATE_FILE, {"nodes": {}, "history": []})
@@ -283,7 +288,7 @@ class Gateway:
             try:
                 ipaddress.ip_address(ip)
             except ValueError:
-                return
+                continue
             mac = ""
             if "lladdr" in parts:
                 idx = parts.index("lladdr")
@@ -303,16 +308,25 @@ class Gateway:
         return macs
 
     def state_nodes(self) -> list[Node]:
-        return [node_from_payload(payload) for payload in (self.state.get("nodes") or {}).values()]
-
-    def next_node_name(self, reserved: set[str]) -> str:
-        index = 1
-        while True:
-            name = f"{self.node_name_prefix}{index:0{self.node_name_digits}d}"
-            if name not in reserved:
-                reserved.add(name)
-                return name
-            index += 1
+        merged: dict[str, Node] = {}
+        for payload in (self.state.get("nodes") or {}).values():
+            node = node_from_payload(payload)
+            real_name = node.system_hostname or node.hostname
+            if not real_name:
+                continue
+            node.hostname = real_name
+            node.system_hostname = real_name
+            existing = merged.get(real_name)
+            if existing is None:
+                merged[real_name] = node
+                continue
+            existing.ip = node.ip or existing.ip
+            existing.mac = node.mac or existing.mac
+            existing.ssh_ok = existing.ssh_ok or node.ssh_ok
+            existing.installed = existing.installed or node.installed
+            existing.cln_id = node.cln_id or existing.cln_id
+            existing.last_seen = max(existing.last_seen, node.last_seen)
+        return list(merged.values())
 
     def probe_system_hostname(self, ip: str) -> str:
         try:
@@ -340,15 +354,8 @@ class Gateway:
 
     def discover_nodes(self) -> list[Node]:
         known = {node.hostname: node for node in self.state_nodes() if node.hostname}
-        reserved = set(known)
         by_mac = {node.mac.lower(): node for node in known.values() if node.mac}
         by_ip = {node.ip: node for node in known.values() if node.ip}
-        by_system_hostname = {
-            key: node
-            for node in known.values()
-            for key in {node.system_hostname, node.hostname}
-            if key
-        }
         candidates: dict[str, dict[str, str]] = {}
 
         def add_candidate(ip: str, mac: str = "", system_hostname: str = "") -> None:
@@ -371,54 +378,59 @@ class Gateway:
 
         discovered: list[Node] = []
         discovered_by_name: dict[str, Node] = {}
+        duplicates: dict[str, list[Node]] = {}
         for candidate in sorted(candidates.values(), key=lambda item: ipaddress.ip_address(item["ip"])):
             ip = candidate["ip"]
             mac = candidate.get("mac", "")
             mac_key = mac.lower()
-            system_hostname = candidate.get("system_hostname", "")
-            if not system_hostname:
-                system_hostname = self.probe_system_hostname(ip)
-            node = known.get(system_hostname) if system_hostname in known else None
-            if node is None and system_hostname:
-                node = by_system_hostname.get(system_hostname)
+            system_hostname = candidate.get("system_hostname", "").split(".")[0].strip()
+            candidate_node = Node(
+                hostname="",
+                ip=ip,
+                mac=mac,
+                system_hostname=system_hostname,
+                last_seen=now_iso(),
+            )
+            self.probe_ssh(candidate_node)
+            real_name = (candidate_node.system_hostname or system_hostname or self.probe_system_hostname(ip)).split(".")[0].strip()
+            if not real_name:
+                log(f"mesh neighbor at {ip} has no reachable SSH hostname yet; skipping")
+                continue
+            candidate_node.hostname = real_name
+            candidate_node.system_hostname = real_name
+            if candidate_node.hostname == self.gateway_name:
+                duplicates.setdefault(candidate_node.hostname, []).append(candidate_node)
+                continue
+            node = known.get(real_name)
             if node is None:
                 node = by_mac.get(mac_key) if mac_key else None
             if node is None:
-                ip_match = by_ip.get(ip)
-                if ip_match and (not ip_match.mac or not mac):
-                    node = ip_match
-            if node is None and not system_hostname:
-                log(f"mesh neighbor at {ip} has no reachable SSH hostname yet; skipping")
-                continue
-            if node is None:
-                node = Node(hostname=self.next_node_name(reserved), ip=ip, mac=mac, last_seen=now_iso())
-                known[node.hostname] = node
-                by_system_hostname[node.hostname] = node
-            candidate_node = Node(
-                hostname=node.hostname,
-                ip=ip,
-                mac=node.mac,
-                system_hostname=node.system_hostname,
-                ssh_ok=node.ssh_ok,
-                cln_id=node.cln_id,
-                installed=node.installed,
-                last_seen=node.last_seen,
-            )
-            if mac:
-                candidate_node.mac = mac
-            if system_hostname:
-                candidate_node.system_hostname = system_hostname
-            self.probe_ssh(candidate_node)
-            if not candidate_node.ssh_ok and not candidate_node.system_hostname:
-                log(f"mesh neighbor at {ip} has no reachable SSH hostname yet; skipping")
-                continue
+                node = by_ip.get(ip)
+            if node is not None:
+                candidate_node.cln_id = node.cln_id
+                candidate_node.installed = node.installed
+                candidate_node.mac = candidate_node.mac or node.mac
             previous = discovered_by_name.get(candidate_node.hostname)
-            if previous is None or (candidate_node.ssh_ok and not previous.ssh_ok):
-                discovered_by_name[candidate_node.hostname] = candidate_node
-                known[candidate_node.hostname] = candidate_node
-                if candidate_node.system_hostname:
-                    by_system_hostname[candidate_node.system_hostname] = candidate_node
+            if previous is not None and (previous.ip != candidate_node.ip or previous.mac != candidate_node.mac):
+                duplicates.setdefault(candidate_node.hostname, [previous]).append(candidate_node)
+                continue
+            discovered_by_name[candidate_node.hostname] = candidate_node
+            known[candidate_node.hostname] = candidate_node
 
+        if duplicates:
+            details = []
+            for hostname, nodes in sorted(duplicates.items()):
+                seen = []
+                if hostname == self.gateway_name:
+                    seen.append(f"gateway ({self.gateway_ip})")
+                for node in nodes:
+                    item = f"{node.ip}"
+                    if node.mac:
+                        item += f" ({node.mac})"
+                    if item not in seen:
+                        seen.append(item)
+                details.append(f"{hostname}: {', '.join(seen)}")
+            raise RuntimeError("duplicate node hostname(s) discovered; hostnames must be unique: " + "; ".join(details))
         discovered = sorted(discovered_by_name.values(), key=lambda n: n.hostname)
         self.state["nodes"] = {node.hostname: asdict(node) for node in discovered}
         save_json(STATE_FILE, self.state)
@@ -487,7 +499,8 @@ class Gateway:
             proc = run(["lightning-cli", f"--lightning-dir=/home/{self.user}/.lightning", "--network", self.config["lightning"]["network"], "getinfo"], check=False)
             if proc.returncode == 0:
                 info = strip_json(proc.stdout)
-                self.config.setdefault("hosts", {}).setdefault(self.gateway_name, {"role": "gateway"})["cln_id"] = info.get("id", "")
+                self.gateway_cln_id = str(info.get("id", ""))
+                self.config.setdefault("hosts", {}).setdefault(self.gateway_name, {"role": "gateway"})["cln_id"] = self.gateway_cln_id
         except Exception:
             pass
 
@@ -524,10 +537,22 @@ class Gateway:
 
     def generate_cluster(self, nodes: list[Node]) -> dict[str, Any]:
         data = load_config()
-        hosts = data.setdefault("hosts", {})
+        old_hosts = data.get("hosts", {})
+        gateway_id = self.gateway_cln_id
+        for name in (self.gateway_name, self.configured_gateway_name):
+            if gateway_id:
+                break
+            entry = old_hosts.get(name) if isinstance(old_hosts, dict) else None
+            if isinstance(entry, dict) and entry.get("cln_id"):
+                gateway_id = str(entry["cln_id"])
+                break
+        hosts: dict[str, Any] = {}
+        data["hosts"] = hosts
         gateway = hosts.setdefault(self.gateway_name, {"role": "gateway"})
         gateway["role"] = "gateway"
         gateway["mesh_ip"] = self.gateway_ip
+        if gateway_id:
+            gateway["cln_id"] = gateway_id
         for node in nodes:
             entry = hosts.setdefault(node.hostname, {})
             entry.update(
@@ -573,7 +598,7 @@ class Gateway:
             self.sudo(node.ip, f"bash {REMOTE_ROOT}/scripts/verify_cycle.sh", capture=False)
 
     def funding_request(self, nodes: list[Node], amount_sat: int, names: list[str]) -> dict[str, Any]:
-        selected = [node for node in nodes if not names or node.hostname in names]
+        selected = [node for node in nodes if node_selected(node, names)]
         requests = []
         for node in selected:
             proc = self.ssh(
@@ -609,7 +634,7 @@ class Gateway:
         return output
 
     def wait_funds(self, nodes: list[Node], names: list[str], timeout: int) -> None:
-        selected = [node for node in nodes if not names or node.hostname in names]
+        selected = [node for node in nodes if node_selected(node, names)]
         for node in selected:
             log(f"waiting for CLN funds on {node.hostname}")
             self.ssh(node.ip, f"python3 {REMOTE_ROOT}/scripts/lnmesh_common.py wait-funds --timeout {timeout}", timeout=timeout + 60)
@@ -715,18 +740,19 @@ class Gateway:
 
 
 def selected_nodes(gw: Gateway, names: list[str] | None = None, *, refresh: bool = False) -> list[Node]:
-    state_nodes = gw.state.get("nodes") or {}
-    nodes = [node_from_payload(payload) for payload in state_nodes.values()]
+    nodes = gw.state_nodes()
     if refresh or not nodes:
         nodes = gw.discover_nodes()
     if names:
-        wanted = set(names)
-        nodes = [
-            node
-            for node in nodes
-            if node.hostname in wanted or node.system_hostname in wanted or node.ip in wanted
-        ]
+        nodes = [node for node in nodes if node_selected(node, names)]
     return sorted(nodes, key=lambda n: n.hostname)
+
+
+def node_selected(node: Node, names: list[str] | None) -> bool:
+    if not names:
+        return True
+    wanted = set(names)
+    return node.hostname in wanted or node.system_hostname in wanted or node.ip in wanted
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -735,7 +761,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--password", default=os.environ.get("OFFLINEMESH_NODE_PASSWORD", DEFAULT_PASSWORD))
     sub = parser.add_subparsers(dest="command", required=True)
 
-    discover = sub.add_parser("discover", help="Discover mesh Pis over bat0 and assign logical node names.")
+    discover = sub.add_parser("discover", help="Discover mesh Pis over bat0 by Linux hostname.")
     discover.set_defaults(func=lambda gw, args: print(json.dumps([asdict(n) for n in gw.discover_nodes()], indent=2, sort_keys=True)))
 
     install_gateway = sub.add_parser("install-gateway", help="Install gateway stack locally.")
@@ -770,28 +796,28 @@ def build_parser() -> argparse.ArgumentParser:
     wait_funds.set_defaults(func=lambda gw, args: gw.wait_funds(selected_nodes(gw, args.nodes), args.nodes, args.timeout))
 
     demo = sub.add_parser("demo", help="Open, pay, and close a channel between two nodes.")
-    demo.add_argument("--source", default="node02")
-    demo.add_argument("--target", default="node01")
+    demo.add_argument("--source", required=True, help="Discovered hostname of the funded/source node.")
+    demo.add_argument("--target", required=True, help="Discovered hostname of the peer/target node.")
     demo.add_argument("--channel-amount-sat", type=int, default=50000)
     demo.add_argument("--invoice-msat", type=int, default=1000)
     demo.set_defaults(func=lambda gw, args: gw.demo(selected_nodes(gw), args.source, args.target, args.channel_amount_sat, args.invoice_msat))
 
     demo_open = sub.add_parser("demo-open", help="Open the demo channel and remember its channel_id.")
-    demo_open.add_argument("--source", default="node02")
-    demo_open.add_argument("--target", default="node01")
+    demo_open.add_argument("--source", required=True, help="Discovered hostname of the funded/source node.")
+    demo_open.add_argument("--target", required=True, help="Discovered hostname of the peer/target node.")
     demo_open.add_argument("--channel-amount-sat", type=int, default=50000)
     demo_open.add_argument("--wait-state", default="lockin")
     demo_open.set_defaults(func=lambda gw, args: gw.demo_open(selected_nodes(gw), args.source, args.target, args.channel_amount_sat, args.wait_state))
 
     demo_pay = sub.add_parser("demo-pay", help="Create an invoice on the target node and pay from the source node.")
-    demo_pay.add_argument("--source", default="node02")
-    demo_pay.add_argument("--target", default="node01")
+    demo_pay.add_argument("--source", required=True, help="Discovered hostname of the funded/source node.")
+    demo_pay.add_argument("--target", required=True, help="Discovered hostname of the peer/target node.")
     demo_pay.add_argument("--invoice-msat", type=int, default=1000)
     demo_pay.set_defaults(func=lambda gw, args: gw.demo_pay(selected_nodes(gw), args.source, args.target, args.invoice_msat))
 
     demo_close = sub.add_parser("demo-close", help="Close the remembered or explicitly provided demo channel.")
-    demo_close.add_argument("--source", default="node02")
-    demo_close.add_argument("--target", default="node01")
+    demo_close.add_argument("--source", required=True, help="Discovered hostname of the funded/source node.")
+    demo_close.add_argument("--target", required=True, help="Discovered hostname of the peer/target node.")
     demo_close.add_argument("--channel-id")
     demo_close.add_argument("--mode", choices=("auto", "cooperative", "force"), default="auto")
     demo_close.add_argument("--timeout", type=int, default=300)

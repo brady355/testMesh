@@ -13,8 +13,6 @@
     "dhcp_end": "192.168.199.99",
     "domain": "local.test",
     "gateway_name": "gateway01",
-    "node_name_prefix": "node",
-    "node_name_digits": 2,
     "profiles": {
       "mesh-a": {
         "essid": "pi-mesh-a",

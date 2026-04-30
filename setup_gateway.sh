@@ -12,8 +12,8 @@ usage() {
 Usage: sudo bash setup_gateway.sh [--force] [--skip-verify] [--user USER]
 
 Run this on the gateway after every Pi has joined the mesh. It installs the
-gateway stack, discovers mesh neighbors, installs any new node Pis, and verifies
-the result.
+gateway stack, discovers mesh neighbors by Linux hostname, installs any new node
+Pis, and verifies the result.
 
 Options:
   --force        Reinstall nodes even if the gateway has seen them before.

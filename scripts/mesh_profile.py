@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -40,7 +41,7 @@ def apply_profile(data: dict[str, Any], profile: str) -> dict[str, Any]:
     merged["profiles"] = profiles
     data["mesh"] = merged
 
-    gateway_name = merged.get("gateway_name", "gateway01")
+    gateway_name = gateway_cluster_name(data, merged)
     gateway = data.setdefault("hosts", {}).setdefault(gateway_name, {"role": "gateway"})
     gateway["role"] = "gateway"
     gateway["mesh_ip"] = mesh_value(data, "gateway_ip")
@@ -48,6 +49,17 @@ def apply_profile(data: dict[str, Any], profile: str) -> dict[str, Any]:
     if data.get("watchtower"):
         data["watchtower"]["api_host"] = mesh_value(data, "gateway_ip")
     return data
+
+
+def gateway_cluster_name(data: dict[str, Any], mesh: dict[str, Any]) -> str:
+    for name, entry in (data.get("hosts") or {}).items():
+        if isinstance(entry, dict) and entry.get("role") == "gateway":
+            return name
+    if current_role() == "gateway":
+        host = socket.gethostname().split(".")[0].strip()
+        if host:
+            return host
+    return mesh.get("gateway_name", "gateway01")
 
 
 def mesh_value(data: dict[str, Any], key: str) -> Any:

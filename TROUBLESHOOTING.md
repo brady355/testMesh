@@ -94,11 +94,14 @@ batctl o || true
 python3 /opt/offlinemesh/scripts/gateway_orchestrator.py discover
 ```
 
-Discovery no longer depends on Linux hostnames. If a Pi does not appear, confirm it ran the node mesh script, has a `bat0` lease, and accepts SSH for the configured gateway user:
+Discovery uses each Pi's real Linux hostname as its cluster name. If a Pi does not appear, confirm it ran the node mesh script, has a unique `hostname -s`, has a `bat0` lease, and accepts SSH for the configured gateway user:
 
 ```bash
+hostname -s
 sudo bash /opt/offlinemesh/setup_pi.sh node --profile mesh-a
 ```
+
+If `discover` or setup reports duplicate hostnames, rename one of the Pis and rerun discovery. The gateway will not invent names like `node01` or `node02`.
 
 If SSH fails, confirm the gateway orchestrator user can log in. The default is `meshlink` with password `1111`; override with `--user` and `OFFLINEMESH_NODE_PASSWORD`, or install an SSH key.
 
@@ -173,7 +176,9 @@ journalctl -u lnmesh-watchtower-register --no-pager -n 120
 Ask the node for a fresh CLN receive address:
 
 ```bash
-sudo python3 /opt/offlinemesh/scripts/gateway_orchestrator.py funding-request node02 --amount-sat 150000
+sudo python3 /opt/offlinemesh/scripts/gateway_orchestrator.py discover
+NODE_NAME=your-node-hostname
+sudo python3 /opt/offlinemesh/scripts/gateway_orchestrator.py funding-request "$NODE_NAME" --amount-sat 150000
 ```
 
 Fund that address from the Windows `offlinemesh_funder` wallet. The gateway command also writes `/var/lib/offlinemesh/funding-request.json`; if you put that JSON file next to this `Final` folder, the helper can make the normal wallet send for you:
@@ -187,7 +192,7 @@ The Windows helper starts local Bitcoin Core when RPC is down and loads `offline
 Wait from the gateway:
 
 ```bash
-sudo python3 /opt/offlinemesh/scripts/gateway_orchestrator.py wait-funds node02 --timeout 7200
+sudo python3 /opt/offlinemesh/scripts/gateway_orchestrator.py wait-funds "$NODE_NAME" --timeout 7200
 ```
 
 Do not fund the same node repeatedly unless you mean to. The request file records the address and amount.
@@ -207,13 +212,15 @@ lightning-cli --lightning-dir=/home/meshlink/.lightning --network=testnet4 listp
 Then rerun:
 
 ```bash
-sudo python3 /opt/offlinemesh/scripts/gateway_orchestrator.py demo --source node02 --target node01
+FUNDED_NODE=your-funded-node-hostname
+PEER_NODE=your-peer-node-hostname
+sudo python3 /opt/offlinemesh/scripts/gateway_orchestrator.py demo --source "$FUNDED_NODE" --target "$PEER_NODE"
 ```
 
 If a channel exists, close it before reset:
 
 ```bash
-python3 /opt/offlinemesh/scripts/close_channel_offline.py --peer node01 --mode auto
+python3 /opt/offlinemesh/scripts/close_channel_offline.py --peer "$PEER_NODE" --mode auto
 ```
 
 ## Reset Problems

@@ -6,7 +6,9 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="/etc/offlinemesh/env"
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
+  set -a
   source "$ENV_FILE"
+  set +a
 fi
 
 ROLE="${OFFLINEMESH_ROLE:-node}"

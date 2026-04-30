@@ -144,11 +144,10 @@ GATEWAY_IP="$(cluster_value mesh.gateway_ip 192.168.199.1)"
 DHCP_START="$(cluster_value mesh.dhcp_start 192.168.199.2)"
 DHCP_END="$(cluster_value mesh.dhcp_end 192.168.199.99)"
 DOMAIN="$(cluster_value mesh.domain local.test)"
-GATEWAY_NAME="$(cluster_value mesh.gateway_name gateway01)"
 WAN_IFACE="${OFFLINEMESH_WAN_IFACE:-eth0}"
 
 if [[ -z "$NODE_ID" && "$ROLE" == "gateway" ]]; then
-  NODE_ID="$GATEWAY_NAME"
+  NODE_ID="$HOST_SHORT"
 fi
 
 log() {

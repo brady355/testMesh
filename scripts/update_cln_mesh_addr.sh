@@ -4,7 +4,9 @@ set -euo pipefail
 ENV_FILE="${OFFLINEMESH_ENV_FILE:-/etc/offlinemesh/env}"
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
+  set -a
   source "$ENV_FILE"
+  set +a
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
