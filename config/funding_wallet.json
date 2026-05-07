@@ -1,9 +1,0 @@
-{
-  "network": "testnet4",
-  "wallet_name": "offlinemesh_funder",
-  "main_machine": {
-    "bitcoin_cli": "C:\\Users\\bmlan\\AppData\\Local\\Programs\\BitcoinCore\\31.0\\bin\\bitcoin-cli.exe",
-    "datadir": "C:\\Users\\bmlan\\AppData\\Roaming\\Bitcoin"
-  },
-  "return_address": "tb1qzvjjpj9w3tjfhcn7ly3er3dxv2zu63p2hqarjv"
-}
