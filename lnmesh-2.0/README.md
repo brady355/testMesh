@@ -44,6 +44,32 @@ chmod +x gateway-setup.sh pay-demo.sh
 ./gateway-setup.sh --user akurt
 ```
 
+The setup command starts a detached background worker and then returns. This is
+intentional: when `wlan0` switches from normal Wi-Fi into IBSS mode, any SSH
+session using Wi-Fi can drop. The setup keeps running on `pi1`.
+
+Watch progress from `pi1`:
+
+```bash
+tail -f ~/.lnmesh/gateway-setup.log
+```
+
+The log includes a simple progress dashboard for all three Pis:
+
+```text
+[lnmesh-progress] pi1 [############----------------]  44%  downloading/installing Bitcoin Core 31.0
+[lnmesh-progress] pi2 [#######---------------------]  25%  base mesh packages ready
+[lnmesh-progress] pi3 [#######---------------------]  25%  base mesh packages ready
+```
+
+Download/build commands also print their normal progress output under the same
+log, so long steps like Bitcoin Core download, apt installs, and the Core
+Lightning build are visible while they run.
+
+If your SSH session drops, reconnect to `pi1` over Ethernet or the reachable
+address and run the same `tail -f` command again. Wait for `setup complete`
+before running `pay-demo.sh`.
+
 The script prompts once for the shared Pi password unless you pass it explicitly:
 
 ```bash
@@ -72,17 +98,22 @@ For command construction checks without touching the Pis:
 Command reference:
 
 ```bash
-./gateway-setup.sh [--user akurt] [--node-password PASSWORD] [--node pi2=HOST --node pi3=HOST] [--dry-run]
+./gateway-setup.sh [--user akurt] [--node-password PASSWORD] [--node pi2=HOST --node pi3=HOST] [--dry-run] [--foreground]
 ./pay-demo.sh [--amount-msat 1000000] [--verbose]
 ```
+
+Use `--foreground` only when debugging from a local console. The default
+detached mode is safer over SSH.
 
 ### What The Script Does
 
 `gateway-setup.sh` automates the long manual setup:
 
 - Discovers `pi2` and `pi3` on the normal Wi-Fi network.
+- Ensures local passwordless sudo on `pi1` for the detached worker.
 - Installs a gateway SSH key and passwordless sudo on the node Pis.
 - Moves all three Pis into IBSS/ad-hoc Wi-Fi mesh mode.
+- Shows per-Pi progress bars in `~/.lnmesh/gateway-setup.log`.
 - Assigns mesh IPs:
   - `pi1`: `10.0.0.1/24`
   - `pi2`: `10.0.0.2/24`
@@ -299,6 +330,8 @@ Expected result: `status: complete`.
 
 - Discovery requires `pi2` and `pi3` to still be on normal Wi-Fi before
   `gateway-setup.sh` starts.
+- SSH sessions can drop when `wlan0` is moved into IBSS mode. The setup runs
+  detached by default; use `tail -f ~/.lnmesh/gateway-setup.log` after reconnecting.
 - Hostnames are expected to be exactly `pi1`, `pi2`, and `pi3`.
 - The automation is fixed to the 3-Pi regtest topology.
 - Reboot persistence is not installed. If a Pi reboots, rerun setup/start steps.

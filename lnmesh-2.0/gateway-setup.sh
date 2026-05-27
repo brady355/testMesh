@@ -6,16 +6,24 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LNMESH_USER="${USER:-akurt}"
 NODE_PASSWORD="${LNMESH_NODE_PASSWORD:-}"
 DRY_RUN=0
+FOREGROUND=0
+WORKER=0
+PASSWORD_FILE=""
 UPLINK_IFACE="${LNMESH_UPLINK_IFACE:-eth0}"
 KEY_PATH="${HOME}/.ssh/lnmesh_ed25519"
 STATE_DIR="${HOME}/.lnmesh"
 STATE_FILE="${STATE_DIR}/lnmesh-2.0.env"
+LOG_FILE="${STATE_DIR}/gateway-setup.log"
+PID_FILE="${STATE_DIR}/gateway-setup.pid"
 DEFAULT_PAYMENT_MSAT="${LNMESH_PAYMENT_MSAT:-1000000}"
 
 declare -A NODE_WIFI_HOST=()
 declare -A NODE_MESH_IP=([pi1]="10.0.0.1" [pi2]="10.0.0.2" [pi3]="10.0.0.3")
 declare -A NODE_MESH_CIDR=([pi1]="10.0.0.1/24" [pi2]="10.0.0.2/24" [pi3]="10.0.0.3/24")
 declare -A NODE_BTC_CONF=([pi1]="bitcoin.conf.pi1" [pi2]="bitcoin.conf.pi2" [pi3]="bitcoin.conf.pi3")
+declare -A NODE_PROGRESS=([pi1]=0 [pi2]=0 [pi3]=0)
+declare -A NODE_STATUS=([pi1]="queued" [pi2]="queued" [pi3]="queued")
+PROGRESS_WIDTH=28
 
 SSH_COMMON_OPTS=(
   -o StrictHostKeyChecking=accept-new
@@ -26,11 +34,13 @@ SSH_COMMON_OPTS=(
 usage() {
   cat <<'EOF'
 Usage:
-  ./gateway-setup.sh [--user akurt] [--node-password PASSWORD] [--node pi2=HOST --node pi3=HOST] [--dry-run]
+  ./gateway-setup.sh [--user akurt] [--node-password PASSWORD] [--node pi2=HOST --node pi3=HOST] [--dry-run] [--foreground]
 
 Runs on pi1 from the lnmesh-2.0 directory. It discovers pi2/pi3 on normal
 Wi-Fi, moves the three Pis onto the IBSS mesh, installs Bitcoin Core/Core
 Lightning, starts regtest daemons, funds wallets, and opens the demo channels.
+By default, the real setup runs detached so it survives SSH drops when wlan0
+switches into IBSS mode. Use --foreground only for debugging from a local console.
 
 Environment:
   LNMESH_NODE_PASSWORD   Shared Pi password, used once for bootstrap.
@@ -41,6 +51,46 @@ EOF
 
 log() {
   printf '[lnmesh-setup] %s\n' "$*"
+}
+
+progress_bar() {
+  local percent="$1"
+  local filled empty
+  filled=$((percent * PROGRESS_WIDTH / 100))
+  empty=$((PROGRESS_WIDTH - filled))
+  printf '%*s' "$filled" '' | tr ' ' '#'
+  printf '%*s' "$empty" '' | tr ' ' '-'
+}
+
+progress_dashboard() {
+  local node percent status
+  printf '[lnmesh-progress] ------------------------------------------------------------\n'
+  for node in pi1 pi2 pi3; do
+    percent="${NODE_PROGRESS[$node]:-0}"
+    status="${NODE_STATUS[$node]:-queued}"
+    printf '[lnmesh-progress] %-3s [%s] %3d%%  %s\n' \
+      "$node" "$(progress_bar "$percent")" "$percent" "$status"
+  done
+}
+
+progress_node() {
+  local node="$1"
+  local percent="$2"
+  shift 2
+  NODE_PROGRESS["$node"]="$percent"
+  NODE_STATUS["$node"]="$*"
+  progress_dashboard
+}
+
+progress_all() {
+  local percent="$1"
+  shift
+  local node
+  for node in pi1 pi2 pi3; do
+    NODE_PROGRESS["$node"]="$percent"
+    NODE_STATUS["$node"]="$*"
+  done
+  progress_dashboard
 }
 
 die() {
@@ -154,6 +204,19 @@ parse_args() {
         DRY_RUN=1
         shift
         ;;
+      --foreground)
+        FOREGROUND=1
+        shift
+        ;;
+      --worker)
+        WORKER=1
+        shift
+        ;;
+      --password-file)
+        [[ $# -ge 2 ]] || die "--password-file requires a value"
+        PASSWORD_FILE="$2"
+        shift 2
+        ;;
       --help|-h)
         usage
         exit 0
@@ -163,6 +226,16 @@ parse_args() {
         ;;
     esac
   done
+}
+
+load_password_file() {
+  if [[ -z "$PASSWORD_FILE" ]]; then
+    return
+  fi
+
+  [[ -r "$PASSWORD_FILE" ]] || die "password file is not readable: ${PASSWORD_FILE}"
+  NODE_PASSWORD="$(<"$PASSWORD_FILE")"
+  rm -f "$PASSWORD_FILE"
 }
 
 validate_inputs() {
@@ -182,9 +255,74 @@ validate_inputs() {
   fi
 }
 
+ensure_local_sudo_for_detached_run() {
+  local user_q
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "+ ensure local sudo works without a tty"
+    return
+  fi
+
+  if sudo -n true >/dev/null 2>&1; then
+    return
+  fi
+
+  user_q="$(quote "$LNMESH_USER")"
+  printf '%s\n' "$NODE_PASSWORD" |
+    sudo -S -p '' bash -lc "printf '%s ALL=(ALL) NOPASSWD:ALL\n' ${user_q} > /etc/sudoers.d/${LNMESH_USER} && chmod 440 /etc/sudoers.d/${LNMESH_USER}" ||
+    die "could not configure passwordless sudo on pi1"
+
+  # Confirm the detached worker will not block on a sudo password prompt.
+  sudo -n true >/dev/null 2>&1 || die "passwordless sudo check failed on pi1"
+}
+
+launch_detached_if_needed() {
+  local credential_file pid
+  local worker_args=()
+
+  if [[ "$WORKER" == "1" || "$FOREGROUND" == "1" || "$DRY_RUN" == "1" ]]; then
+    return
+  fi
+
+  validate_inputs
+  ensure_local_sudo_for_detached_run
+  mkdir -p "$STATE_DIR"
+  credential_file="$(mktemp "${STATE_DIR}/gateway-setup.password.XXXXXX")"
+  chmod 600 "$credential_file"
+  printf '%s' "$NODE_PASSWORD" > "$credential_file"
+
+  worker_args=(--worker --user "$LNMESH_USER" --password-file "$credential_file")
+  if [[ -n "${NODE_WIFI_HOST[pi2]:-}" ]]; then
+    worker_args+=(--node "pi2=${NODE_WIFI_HOST[pi2]}")
+  fi
+  if [[ -n "${NODE_WIFI_HOST[pi3]:-}" ]]; then
+    worker_args+=(--node "pi3=${NODE_WIFI_HOST[pi3]}")
+  fi
+
+  : > "$LOG_FILE"
+  (
+    cd "$SCRIPT_DIR"
+    nohup env \
+      LNMESH_UPLINK_IFACE="$UPLINK_IFACE" \
+      LNMESH_PAYMENT_MSAT="$DEFAULT_PAYMENT_MSAT" \
+      bash "$SCRIPT_DIR/gateway-setup.sh" "${worker_args[@]}" \
+      >>"$LOG_FILE" 2>&1 < /dev/null &
+    echo $! > "$PID_FILE"
+  )
+
+  pid="$(cat "$PID_FILE")"
+  log "setup is running detached as PID ${pid}"
+  log "follow progress with:"
+  log "  tail -f ${LOG_FILE}"
+  log "if this SSH session drops, reconnect to pi1 and run that tail command again"
+  exit 0
+}
+
 install_gateway_dependencies() {
   local missing=()
   local tool pkg_string
+  progress_node pi1 4 "checking gateway packages"
+
   for tool in nmap sshpass jq wget curl tar iw rfkill nft ip ping; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       missing+=("$tool")
@@ -193,20 +331,25 @@ install_gateway_dependencies() {
 
   if [[ "${#missing[@]}" -eq 0 ]]; then
     log "gateway dependencies are already installed"
+    progress_node pi1 8 "gateway packages ready"
     return
   fi
 
   pkg_string="nmap sshpass jq wget curl tar iw rfkill nftables iproute2 iputils-ping"
+  progress_node pi1 5 "downloading gateway packages"
   run_sudo_bash "apt-get update && apt-get install -y ${pkg_string}"
+  progress_node pi1 8 "gateway packages ready"
 }
 
 validate_uplink() {
   if [[ "$DRY_RUN" == "1" ]]; then
+    progress_node pi1 10 "uplink check skipped in dry-run"
     return
   fi
 
   ip link show "$UPLINK_IFACE" >/dev/null 2>&1 ||
     die "uplink interface ${UPLINK_IFACE} not found; set LNMESH_UPLINK_IFACE or plug Ethernet into pi1"
+  progress_node pi1 10 "uplink ${UPLINK_IFACE} ready"
 }
 
 probe_hostname() {
@@ -245,6 +388,8 @@ discover_nodes() {
 
   if [[ -n "${NODE_WIFI_HOST[pi2]:-}" && -n "${NODE_WIFI_HOST[pi3]:-}" ]]; then
     log "using manually supplied node addresses: pi2=${NODE_WIFI_HOST[pi2]}, pi3=${NODE_WIFI_HOST[pi3]}"
+    progress_node pi2 10 "discovered at ${NODE_WIFI_HOST[pi2]}"
+    progress_node pi3 10 "discovered at ${NODE_WIFI_HOST[pi3]}"
     return
   fi
 
@@ -274,6 +419,8 @@ discover_nodes() {
 
   [[ -n "${NODE_WIFI_HOST[pi2]:-}" ]] || die "could not discover pi2; rerun with --node pi2=HOST"
   [[ -n "${NODE_WIFI_HOST[pi3]:-}" ]] || die "could not discover pi3; rerun with --node pi3=HOST"
+  progress_node pi2 10 "discovered at ${NODE_WIFI_HOST[pi2]}"
+  progress_node pi3 10 "discovered at ${NODE_WIFI_HOST[pi3]}"
 }
 
 ensure_gateway_key() {
@@ -313,18 +460,23 @@ install_sudoers_on_node() {
 bootstrap_nodes() {
   local node
   ensure_gateway_key
+  progress_node pi1 15 "gateway SSH key ready"
   for node in pi2 pi3; do
+    progress_node "$node" 12 "bootstrapping SSH and sudo"
     log "bootstrapping ${node} at ${NODE_WIFI_HOST[$node]}"
     install_key_on_node "$node"
     install_sudoers_on_node "$node"
     ssh_key "${NODE_WIFI_HOST[$node]}" "sudo -n true"
+    progress_node "$node" 18 "SSH and passwordless sudo ready"
   done
 }
 
 install_node_base_dependencies() {
   local node
   for node in pi2 pi3; do
+    progress_node "$node" 20 "downloading base mesh packages"
     remote_sudo_key "${NODE_WIFI_HOST[$node]}" "apt-get update && apt-get install -y iw rfkill wget curl tar jq"
+    progress_node "$node" 25 "base mesh packages ready"
   done
 }
 
@@ -346,12 +498,17 @@ start_mesh() {
   for node in pi2 pi3; do
     host="${NODE_WIFI_HOST[$node]}"
     unit="lnmesh-mesh-${node}-$(date +%s)"
+    progress_node "$node" 30 "switching wlan0 to IBSS mesh"
     remote_sudo_key "$host" "systemd-run --no-block --unit=${unit} bash /home/${LNMESH_USER}/lnmesh/mesh-up.sh ${NODE_MESH_CIDR[$node]}"
   done
 
+  progress_node pi1 30 "switching wlan0 to IBSS mesh"
   run_sudo_bash "bash $(quote "${SCRIPT_DIR}/mesh-up.sh") ${NODE_MESH_CIDR[pi1]}"
   wait_for_mesh_node pi2
+  progress_node pi2 35 "mesh reachable at ${NODE_MESH_IP[pi2]}"
   wait_for_mesh_node pi3
+  progress_node pi3 35 "mesh reachable at ${NODE_MESH_IP[pi3]}"
+  progress_node pi1 35 "mesh IP ${NODE_MESH_IP[pi1]} ready"
 }
 
 wait_for_mesh_node() {
@@ -376,6 +533,7 @@ wait_for_mesh_node() {
 }
 
 configure_bridge() {
+  progress_all 38 "configuring pi1 internet bridge"
   run_sudo_bash "sysctl -w net.ipv4.ip_forward=1"
   run_sudo_bash "nft list table ip nat >/dev/null 2>&1 || nft add table ip nat"
   run_sudo_bash "nft list chain ip nat postrouting >/dev/null 2>&1 || nft 'add chain ip nat postrouting { type nat hook postrouting priority 100; }'"
@@ -383,6 +541,7 @@ configure_bridge() {
 
   remote_sudo_key "${NODE_MESH_IP[pi2]}" "ip route replace default via ${NODE_MESH_IP[pi1]} dev wlan0 metric 100 && rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf"
   remote_sudo_key "${NODE_MESH_IP[pi3]}" "ip route replace default via ${NODE_MESH_IP[pi1]} dev wlan0 metric 100 && rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf"
+  progress_all 40 "internet bridge ready"
 }
 
 bitcoin_install_cmd() {
@@ -393,7 +552,7 @@ if command -v bitcoind >/dev/null 2>&1 && bitcoind -version 2>/dev/null | grep -
 fi
 cd /tmp
 archive=bitcoin-31.0-aarch64-linux-gnu.tar.gz
-wget -q -nc "https://bitcoincore.org/bin/bitcoin-core-31.0/${archive}"
+wget -c --progress=bar:force:noscroll "https://bitcoincore.org/bin/bitcoin-core-31.0/${archive}"
 sudo tar -xzf "$archive" -C /opt/
 sudo ln -sf /opt/bitcoin-31.0/bin/bitcoind /usr/local/bin/
 sudo ln -sf /opt/bitcoin-31.0/bin/bitcoin-cli /usr/local/bin/
@@ -403,9 +562,13 @@ EOF
 install_bitcoin_core() {
   local cmd node
   cmd="$(bitcoin_install_cmd)"
+  progress_node pi1 44 "downloading/installing Bitcoin Core 31.0"
   run_bash "$cmd"
+  progress_node pi1 55 "Bitcoin Core ready"
   for node in pi2 pi3; do
+    progress_node "$node" 44 "downloading/installing Bitcoin Core 31.0"
     ssh_key "${NODE_MESH_IP[$node]}" "$cmd"
+    progress_node "$node" 55 "Bitcoin Core ready"
   done
 }
 
@@ -420,16 +583,16 @@ sudo apt-get install -y jq autoconf automake build-essential git libtool \
   libsqlite3-dev libffi-dev python3 python3-pip python3-venv net-tools \
   zlib1g-dev libsodium-dev libssl-dev gettext lowdown cargo rustfmt protobuf-compiler
 if ! command -v uv >/dev/null 2>&1; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+  curl -#Lf https://astral.sh/uv/install.sh | sh
 fi
 export PATH="$HOME/.local/bin:$PATH"
 if [[ ! -d "$HOME/cln/.git" ]]; then
-  git clone --branch v26.04.1 https://github.com/ElementsProject/lightning.git "$HOME/cln"
+  git clone --progress --branch v26.04.1 https://github.com/ElementsProject/lightning.git "$HOME/cln"
 fi
 cd "$HOME/cln"
-git fetch --tags origin v26.04.1 || true
+git fetch --progress --tags origin v26.04.1 || true
 git checkout v26.04.1
-git submodule update --init --recursive
+git submodule update --init --recursive --progress
 uv sync --all-extras --all-groups --frozen
 source .venv/bin/activate
 ./configure
@@ -451,17 +614,24 @@ install_core_lightning() {
   local cmd node
 
   cmd="$(cln_build_cmd)"
+  progress_node pi1 58 "downloading/building Core Lightning v26.04.1"
   run_bash "$cmd"
+  progress_node pi1 75 "Core Lightning ready"
 
   cmd="$(install_cln_runtime_cmd)"
   for node in pi2 pi3; do
+    progress_node "$node" 58 "downloading CLN runtime packages"
     ssh_key "${NODE_MESH_IP[$node]}" "$cmd"
+    progress_node "$node" 62 "CLN runtime packages ready"
   done
 
+  progress_node pi1 78 "packing CLN binaries for nodes"
   run_sudo_bash "tar -cf /tmp/cln.tar -C / usr/local/bin/lightning-cli usr/local/bin/lightningd usr/local/bin/lightning-hsmtool usr/local/libexec/c-lightning && chmod a+r /tmp/cln.tar"
   for node in pi2 pi3; do
+    progress_node "$node" 70 "copying CLN binaries from pi1"
     scp_key "/tmp/cln.tar" "${LNMESH_USER}@${NODE_MESH_IP[$node]}:/tmp/cln.tar"
     remote_sudo_key "${NODE_MESH_IP[$node]}" "cd / && tar -xf /tmp/cln.tar"
+    progress_node "$node" 75 "Core Lightning ready"
   done
 }
 
@@ -480,6 +650,7 @@ write_configs() {
   tmp_cfg="$(mktemp)"
   make_lightning_config "$tmp_cfg"
 
+  progress_all 80 "writing Bitcoin and Lightning configs"
   run mkdir -p "${HOME}/.bitcoin" "${HOME}/.lightning"
   run cp "${SCRIPT_DIR}/${NODE_BTC_CONF[pi1]}" "${HOME}/.bitcoin/bitcoin.conf"
   run cp "$tmp_cfg" "${HOME}/.lightning/config"
@@ -491,6 +662,7 @@ write_configs() {
   done
 
   rm -f "$tmp_cfg"
+  progress_all 82 "configs written"
 }
 
 start_stack_cmd() {
@@ -509,9 +681,13 @@ EOF
 start_stack() {
   local cmd node
   cmd="$(start_stack_cmd)"
+  progress_node pi1 86 "starting bitcoind and lightningd"
   run_bash "$cmd"
+  progress_node pi1 90 "daemons running"
   for node in pi2 pi3; do
+    progress_node "$node" 86 "starting bitcoind and lightningd"
     ssh_key "${NODE_MESH_IP[$node]}" "$cmd"
+    progress_node "$node" 90 "daemons running"
   done
 }
 
@@ -592,9 +768,13 @@ wait_channel_normal_remote() {
 fund_wallets_and_open_channels() {
   local pi1_addr pi2_addr pi2_id pi3_id opened=0
 
+  progress_all 92 "creating/loading miner wallet"
   ensure_miner_wallet
+  progress_all 93 "mining regtest maturity blocks"
   mine_blocks 101
 
+  progress_node pi1 94 "creating CLN receive address"
+  progress_node pi2 94 "creating CLN receive address"
   if [[ "$DRY_RUN" == "1" ]]; then
     pi1_addr="bcrt1dryrunpi1"
     pi2_addr="bcrt1dryrunpi2"
@@ -608,11 +788,14 @@ fund_wallets_and_open_channels() {
     [[ -n "$pi2_addr" ]] || die "could not get pi2 CLN address"
   fi
 
+  progress_node pi1 95 "funding CLN wallet"
+  progress_node pi2 95 "funding CLN wallet"
   run_bash "bitcoin-cli -regtest -rpcwallet=miner sendtoaddress $(quote "$pi1_addr") 0.5 >/dev/null"
   run_bash "bitcoin-cli -regtest -rpcwallet=miner sendtoaddress $(quote "$pi2_addr") 0.5 >/dev/null"
   mine_blocks 1
   [[ "$DRY_RUN" == "1" ]] || sleep 4
 
+  progress_all 96 "collecting Lightning node IDs"
   if [[ "$DRY_RUN" == "1" ]]; then
     pi2_id="dryrun-pi2-node-id"
     pi3_id="dryrun-pi3-node-id"
@@ -626,6 +809,7 @@ fund_wallets_and_open_channels() {
     [[ -n "$pi3_id" ]] || die "could not get pi3 CLN id"
   fi
 
+  progress_all 97 "connecting peers and opening channels"
   run_bash "lightning-cli --regtest connect $(quote "${pi2_id}@${NODE_MESH_IP[pi2]}:9735") >/dev/null 2>&1 || true"
   ssh_key "${NODE_MESH_IP[pi2]}" "lightning-cli --regtest connect $(quote "${pi3_id}@${NODE_MESH_IP[pi3]}:9735") >/dev/null 2>&1 || true"
 
@@ -644,11 +828,13 @@ fund_wallets_and_open_channels() {
   fi
 
   if [[ "$opened" == "1" ]]; then
+    progress_all 98 "confirming channel funding transactions"
     [[ "$DRY_RUN" == "1" ]] || sleep 6
     mine_blocks 6
     [[ "$DRY_RUN" == "1" ]] || sleep 6
   fi
 
+  progress_all 99 "verifying CHANNELD_NORMAL"
   wait_channel_normal_local "$pi2_id" || die "pi1 <-> pi2 channel did not become CHANNELD_NORMAL"
   wait_channel_normal_remote pi2 "$pi3_id" || die "pi2 <-> pi3 channel did not become CHANNELD_NORMAL"
 }
@@ -657,6 +843,7 @@ write_state_file() {
   run mkdir -p "$STATE_DIR"
   if [[ "$DRY_RUN" == "1" ]]; then
     log "+ write ${STATE_FILE}"
+    progress_all 100 "setup complete"
     return
   fi
   cat > "$STATE_FILE" <<EOF
@@ -669,6 +856,7 @@ LNMESH_PAYMENT_MSAT=${DEFAULT_PAYMENT_MSAT@Q}
 EOF
   chmod 600 "$STATE_FILE"
   log "wrote runtime state to ${STATE_FILE}"
+  progress_all 100 "setup complete"
 }
 
 summary() {
@@ -679,7 +867,10 @@ summary() {
 
 main() {
   parse_args "$@"
+  load_password_file
+  launch_detached_if_needed
   validate_inputs
+  progress_all 0 "queued"
   install_gateway_dependencies
   validate_uplink
   discover_nodes
