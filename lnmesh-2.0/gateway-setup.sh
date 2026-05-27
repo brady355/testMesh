@@ -121,11 +121,11 @@ run_bash() {
 
 run_sudo_bash() {
   local cmd="$1"
-  log "+ sudo bash -lc ${cmd}"
+  log "+ sudo -n bash -lc ${cmd}"
   if [[ "$DRY_RUN" == "1" ]]; then
     return 0
   fi
-  sudo bash -lc "$cmd"
+  sudo -n bash -lc "$cmd"
 }
 
 ssh_password() {
@@ -172,7 +172,7 @@ remote_sudo_key() {
   local cmd="$2"
   local cmd_q
   cmd_q="$(quote "$cmd")"
-  ssh_key "$host" "sudo bash -lc ${cmd_q}"
+  ssh_key "$host" "sudo -n bash -lc ${cmd_q}"
 }
 
 parse_args() {
@@ -255,25 +255,27 @@ validate_inputs() {
   fi
 }
 
-ensure_local_sudo_for_detached_run() {
+ensure_local_passwordless_sudo() {
   local user_q
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    log "+ ensure local sudo works without a tty"
+    log "+ ensure local passwordless sudo works without a tty"
     return
   fi
 
   if sudo -n true >/dev/null 2>&1; then
+    progress_node pi1 3 "passwordless sudo ready"
     return
   fi
 
+  [[ -n "$NODE_PASSWORD" ]] || die "node password is required to configure passwordless sudo on pi1"
   user_q="$(quote "$LNMESH_USER")"
   printf '%s\n' "$NODE_PASSWORD" |
     sudo -S -p '' bash -lc "printf '%s ALL=(ALL) NOPASSWD:ALL\n' ${user_q} > /etc/sudoers.d/${LNMESH_USER} && chmod 440 /etc/sudoers.d/${LNMESH_USER}" ||
     die "could not configure passwordless sudo on pi1"
 
-  # Confirm the detached worker will not block on a sudo password prompt.
   sudo -n true >/dev/null 2>&1 || die "passwordless sudo check failed on pi1"
+  progress_node pi1 3 "passwordless sudo ready"
 }
 
 launch_detached_if_needed() {
@@ -285,7 +287,7 @@ launch_detached_if_needed() {
   fi
 
   validate_inputs
-  ensure_local_sudo_for_detached_run
+  ensure_local_passwordless_sudo
   mkdir -p "$STATE_DIR"
   credential_file="$(mktemp "${STATE_DIR}/gateway-setup.password.XXXXXX")"
   chmod 600 "$credential_file"
@@ -480,6 +482,19 @@ install_node_base_dependencies() {
   done
 }
 
+verify_passwordless_sudo_over_mesh() {
+  progress_all 36 "verifying passwordless sudo over mesh"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "+ sudo -n true on pi1, pi2, pi3"
+    return
+  fi
+
+  sudo -n true >/dev/null 2>&1 || die "passwordless sudo is not working on pi1"
+  ssh_key "${NODE_MESH_IP[pi2]}" "sudo -n true" || die "passwordless sudo is not working on pi2"
+  ssh_key "${NODE_MESH_IP[pi3]}" "sudo -n true" || die "passwordless sudo is not working on pi3"
+  progress_all 37 "passwordless sudo verified"
+}
+
 copy_mesh_script_to_nodes() {
   local node host
   for node in pi2 pi3; do
@@ -553,9 +568,9 @@ fi
 cd /tmp
 archive=bitcoin-31.0-aarch64-linux-gnu.tar.gz
 wget -c --progress=bar:force:noscroll "https://bitcoincore.org/bin/bitcoin-core-31.0/${archive}"
-sudo tar -xzf "$archive" -C /opt/
-sudo ln -sf /opt/bitcoin-31.0/bin/bitcoind /usr/local/bin/
-sudo ln -sf /opt/bitcoin-31.0/bin/bitcoin-cli /usr/local/bin/
+sudo -n tar -xzf "$archive" -C /opt/
+sudo -n ln -sf /opt/bitcoin-31.0/bin/bitcoind /usr/local/bin/
+sudo -n ln -sf /opt/bitcoin-31.0/bin/bitcoin-cli /usr/local/bin/
 EOF
 }
 
@@ -578,8 +593,8 @@ set -e
 if command -v lightningd >/dev/null 2>&1 && lightningd --version 2>/dev/null | grep -q 'v26.04.1'; then
   exit 0
 fi
-sudo apt-get update
-sudo apt-get install -y jq autoconf automake build-essential git libtool \
+sudo -n apt-get update
+sudo -n apt-get install -y jq autoconf automake build-essential git libtool \
   libsqlite3-dev libffi-dev python3 python3-pip python3-venv net-tools \
   zlib1g-dev libsodium-dev libssl-dev gettext lowdown cargo rustfmt protobuf-compiler
 if ! command -v uv >/dev/null 2>&1; then
@@ -597,16 +612,16 @@ uv sync --all-extras --all-groups --frozen
 source .venv/bin/activate
 ./configure
 make -j"$(nproc)"
-sudo make install
-sudo strip /usr/local/bin/lightning* /usr/local/libexec/c-lightning/lightning_* /usr/local/libexec/c-lightning/plugins/* || true
+sudo -n make install
+sudo -n strip /usr/local/bin/lightning* /usr/local/libexec/c-lightning/lightning_* /usr/local/libexec/c-lightning/plugins/* || true
 EOF
 }
 
 install_cln_runtime_cmd() {
   cat <<'EOF'
 set -e
-sudo apt-get update
-sudo apt-get install -y libsodium23 jq
+sudo -n apt-get update
+sudo -n apt-get install -y libsodium23 jq
 EOF
 }
 
@@ -871,12 +886,14 @@ main() {
   launch_detached_if_needed
   validate_inputs
   progress_all 0 "queued"
+  ensure_local_passwordless_sudo
   install_gateway_dependencies
   validate_uplink
   discover_nodes
   bootstrap_nodes
   install_node_base_dependencies
   start_mesh
+  verify_passwordless_sudo_over_mesh
   configure_bridge
   install_bitcoin_core
   install_core_lightning

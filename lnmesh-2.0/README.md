@@ -112,6 +112,7 @@ detached mode is safer over SSH.
 - Discovers `pi2` and `pi3` on the normal Wi-Fi network.
 - Ensures local passwordless sudo on `pi1` for the detached worker.
 - Installs a gateway SSH key and passwordless sudo on the node Pis.
+- Verifies passwordless sudo on all three Pis before long downloads/builds.
 - Moves all three Pis into IBSS/ad-hoc Wi-Fi mesh mode.
 - Shows per-Pi progress bars in `~/.lnmesh/gateway-setup.log`.
 - Assigns mesh IPs:
@@ -332,6 +333,9 @@ Expected result: `status: complete`.
   `gateway-setup.sh` starts.
 - SSH sessions can drop when `wlan0` is moved into IBSS mode. The setup runs
   detached by default; use `tail -f ~/.lnmesh/gateway-setup.log` after reconnecting.
+- The automation intentionally uses `sudo -n` after bootstrap. If passwordless
+  sudo is not working on any Pi, setup fails early instead of hanging on a
+  password prompt.
 - Hostnames are expected to be exactly `pi1`, `pi2`, and `pi3`.
 - The automation is fixed to the 3-Pi regtest topology.
 - Reboot persistence is not installed. If a Pi reboots, rerun setup/start steps.
