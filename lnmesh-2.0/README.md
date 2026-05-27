@@ -1,113 +1,209 @@
 # LNMesh 2.0
 
-A 3-node testbed where Bitcoin Core + Core Lightning run over a wireless ad-hoc mesh. One Pi has internet; the other two reach the chain transparently through it via Bitcoin's built-in P2P relay. Open / close channels and route LN payments work even when the offline Pis have no idea which Pi is the online one.
+A 3-node testbed where Bitcoin Core and Core Lightning run over a wireless
+ad-hoc mesh. One Raspberry Pi has Ethernet/internet access; the other two reach
+the chain through it via Bitcoin's built-in P2P relay. The final topology is the
+same as the original manual guide: `pi1 <-> pi2 <-> pi3` on regtest, with
+Lightning channels ready before you send a payment.
 
-This repo is a follow-up to the [LNMesh paper](https://ieeexplore.ieee.org/document/10195433) (IEEE WoWMoM 2023). For the original 8-Pi `batman-adv` setup see the [original repo](https://github.com/ahmet-kurt/LNMesh).
+This repo is a follow-up to the [LNMesh paper](https://ieeexplore.ieee.org/document/10195433)
+(IEEE WoWMoM 2023). For the original 8-Pi `batman-adv` setup, see the
+[original repo](https://github.com/ahmet-kurt/LNMesh).
 
-## What you need
+## What You Need
 
-- **3× Raspberry Pi** — Pi 4 or Pi 5, 8 GB RAM, 64 GB SD card each. Pi 5 makes the CLN build much faster.
-- **1× Ethernet cable** for the gateway Pi.
-- A POSIX-shell terminal — Linux/macOS/WSL, or **Git Bash on Windows** ([Git for Windows](https://git-scm.com/download/win)). PowerShell won't work for many of the bash idioms below.
+- 3 Raspberry Pis, named `pi1`, `pi2`, and `pi3`.
+- Raspberry Pi OS 64-bit on each Pi.
+- The same username and password on every Pi. This guide uses `akurt`.
+- SSH enabled with password authentication.
+- All Pis initially connected to the same normal Wi-Fi network.
+- Ethernet plugged into `pi1`.
+- This repo cloned on `pi1`, with commands run from `lnmesh-2.0`.
 
-## 1. Image the SD cards
+Pi 4 or Pi 5 with 8 GB RAM and 64 GB SD cards are recommended. Pi 5 builds Core
+Lightning much faster.
 
-Use Raspberry Pi Imager → **Raspberry Pi OS (64-bit)**. In **Edit Settings**:
-- Hostname: `pi1`, `pi2`, `pi3` (one per card)
-- Username + password: same on every Pi (this guide uses `akurt`). You'll need the password once, for `ssh-copy-id`.
-- Wi-Fi: your home network
-- **Services tab:** check "Enable SSH" with password authentication (no need to paste your public key here)
+## Automated Setup
 
-Boot all three Pis. Find each one's IP — easiest way is plugging in a monitor + keyboard and running `ip a`. Note them down — we'll refer to them as `<PI1_WIFI>`, `<PI2_WIFI>`, `<PI3_WIFI>` throughout this doc. (One Pi will get an Ethernet IP later we'll call `<PI1_ETH>`.)
+Image the SD cards with Raspberry Pi Imager. In **Edit Settings**, set:
 
-## 2. Push your SSH key to each Pi
+- Hostnames: `pi1`, `pi2`, `pi3`
+- Username/password: the same on all three Pis
+- Wi-Fi: your normal network
+- Services: enable SSH with password authentication
 
-```bash
-# Skip if you already have ~/.ssh/id_ed25519 or id_rsa on your laptop:
-ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
+Boot all three Pis. Leave `pi2` and `pi3` on normal Wi-Fi for discovery, and
+plug Ethernet into `pi1`.
 
-ssh-copy-id akurt@<PI1_WIFI>
-ssh-copy-id akurt@<PI2_WIFI>
-ssh-copy-id akurt@<PI3_WIFI>
-```
-
-Type the Pi's password (the one from the imager) when prompted. After this, SSH works without a password.
-
-## 3. Passwordless sudo (one-time, per Pi)
-
-```bash
-ssh -t akurt@<PI1_WIFI> "echo 'akurt ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/akurt && sudo chmod 440 /etc/sudoers.d/akurt"
-ssh -t akurt@<PI2_WIFI> "echo 'akurt ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/akurt && sudo chmod 440 /etc/sudoers.d/akurt"
-ssh -t akurt@<PI3_WIFI> "echo 'akurt ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/akurt && sudo chmod 440 /etc/sudoers.d/akurt"
-```
-
-Type the Pi's password for each (`-t` allocates a TTY so `sudo` can prompt).
-
-## 4. Wireless mesh (IBSS)
-
-Pi's built-in Broadcom Wi-Fi doesn't support 802.11s mesh point, but it does support IBSS (ad-hoc). `mesh-up.sh` sets `wlan0` to IBSS mode with a fixed SSID + channel + IP.
-
-**Plug Ethernet into pi1.** Find its new eth0 IP (run `ip a` on pi1 again, or check the router) — we'll call it `<PI1_ETH>` from here on.
-
-Push the script to each Pi:
-```bash
-ssh akurt@<PI1_ETH>  'mkdir -p ~/lnmesh' && scp mesh-up.sh akurt@<PI1_ETH>:~/lnmesh/
-ssh akurt@<PI2_WIFI> 'mkdir -p ~/lnmesh' && scp mesh-up.sh akurt@<PI2_WIFI>:~/lnmesh/
-ssh akurt@<PI3_WIFI> 'mkdir -p ~/lnmesh' && scp mesh-up.sh akurt@<PI3_WIFI>:~/lnmesh/
-```
-
-Run it — pi1 first (Ethernet keeps SSH alive), then pi2 / pi3:
-```bash
-ssh akurt@<PI1_ETH>  'sudo bash ~/lnmesh/mesh-up.sh 10.0.0.1/24'
-ssh akurt@<PI2_WIFI> 'sudo systemd-run --no-block --unit=mesh bash /home/akurt/lnmesh/mesh-up.sh 10.0.0.2/24'
-ssh akurt@<PI3_WIFI> 'sudo systemd-run --no-block --unit=mesh bash /home/akurt/lnmesh/mesh-up.sh 10.0.0.3/24'
-```
-
-`systemd-run --no-block` is needed for pi2/pi3 because the script swaps wlan0 from your home Wi-Fi to IBSS mid-run, which kills the SSH session. Detaching the script lets it finish in the background.
-
-After this, pi2/pi3 are reachable via pi1 as a jump host:
-```bash
-ssh -J akurt@<PI1_ETH> akurt@10.0.0.2
-```
-
-## 5. Internet bridge through pi1
-
-So pi2/pi3 can reach the apt repos and bitcoincore.org for installs:
+On `pi1`, clone this repo and run the gateway setup script:
 
 ```bash
-# On pi1:
-ssh akurt@<PI1_ETH> 'sudo sysctl -w net.ipv4.ip_forward=1 && \
-  sudo nft add table ip nat && \
-  sudo nft "add chain ip nat postrouting { type nat hook postrouting priority 100; }" && \
-  sudo nft add rule ip nat postrouting oifname eth0 masquerade'
-
-# On pi2 and pi3:
-for IP in 10.0.0.2 10.0.0.3; do
-  ssh -J akurt@<PI1_ETH> akurt@$IP 'sudo ip route add default via 10.0.0.1 && \
-    sudo rm -f /etc/resolv.conf && \
-    echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf'
-done
+git clone https://github.com/brady355/testMesh.git
+cd testMesh/lnmesh-2.0
+chmod +x gateway-setup.sh pay-demo.sh
+./gateway-setup.sh --user akurt
 ```
 
-Tear down later with `sudo nft delete table ip nat` on pi1 (used during the offline scenarios below).
-
-## 6. Bitcoin Core 31.0
-
-Same one-liner on every Pi:
+The script prompts once for the shared Pi password unless you pass it explicitly:
 
 ```bash
-cd /tmp && \
-  wget -q https://bitcoincore.org/bin/bitcoin-core-31.0/bitcoin-31.0-aarch64-linux-gnu.tar.gz && \
-  sudo tar -xzf bitcoin-31.0-aarch64-linux-gnu.tar.gz -C /opt/ && \
-  sudo ln -sf /opt/bitcoin-31.0/bin/bitcoind /usr/local/bin/ && \
-  sudo ln -sf /opt/bitcoin-31.0/bin/bitcoin-cli /usr/local/bin/
+LNMESH_NODE_PASSWORD='password' ./gateway-setup.sh --user akurt
+./gateway-setup.sh --user akurt --node-password password
 ```
 
-## 7. Core Lightning v26.04.1
+If LAN discovery cannot find `pi2` or `pi3`, pass their current Wi-Fi IPs:
 
-CLN doesn't ship aarch64 binaries — we build on pi1 (Pi 5 ≈ 20 min) and copy the result to the others.
+```bash
+./gateway-setup.sh --user akurt --node pi2=192.168.1.23 --node pi3=192.168.1.24
+```
 
-### On pi1 — build
+If `pi1`'s Ethernet interface is not `eth0`, name the uplink explicitly:
+
+```bash
+LNMESH_UPLINK_IFACE=end0 ./gateway-setup.sh --user akurt
+```
+
+For command construction checks without touching the Pis:
+
+```bash
+./gateway-setup.sh --user akurt --node pi2=192.168.1.23 --node pi3=192.168.1.24 --dry-run
+```
+
+Command reference:
+
+```bash
+./gateway-setup.sh [--user akurt] [--node-password PASSWORD] [--node pi2=HOST --node pi3=HOST] [--dry-run]
+./pay-demo.sh [--amount-msat 1000000] [--verbose]
+```
+
+### What The Script Does
+
+`gateway-setup.sh` automates the long manual setup:
+
+- Discovers `pi2` and `pi3` on the normal Wi-Fi network.
+- Installs a gateway SSH key and passwordless sudo on the node Pis.
+- Moves all three Pis into IBSS/ad-hoc Wi-Fi mesh mode.
+- Assigns mesh IPs:
+  - `pi1`: `10.0.0.1/24`
+  - `pi2`: `10.0.0.2/24`
+  - `pi3`: `10.0.0.3/24`
+- Configures the temporary NAT bridge through `pi1`.
+- Installs Bitcoin Core 31.0 on all Pis.
+- Builds Core Lightning v26.04.1 on `pi1` and copies the binaries to `pi2` and
+  `pi3`.
+- Writes Bitcoin and Lightning configs.
+- Starts `bitcoind` and `lightningd`.
+- Creates or loads the regtest `miner` wallet on `pi1`.
+- Mines maturity blocks, funds CLN wallets, and opens the `pi1 <-> pi2` and
+  `pi2 <-> pi3` channels.
+- Verifies the channels are ready before exiting.
+
+When setup finishes, the network should already be at the pre-payment state.
+
+## Simple Payment
+
+Run the default demo payment from `pi1`:
+
+```bash
+./pay-demo.sh
+```
+
+By default, this creates an invoice on `pi3` and pays it from `pi1` over the
+`pi1 -> pi2 -> pi3` route. The script prints a concise receipt with the payer,
+receiver, amount, status, payment hash, and preimage.
+
+Use a different amount:
+
+```bash
+./pay-demo.sh --amount-msat 1000000
+```
+
+Show the raw `lightning-cli` JSON as well:
+
+```bash
+./pay-demo.sh --verbose
+```
+
+You can also set the default amount with an environment variable:
+
+```bash
+LNMESH_PAYMENT_MSAT=1000000 ./pay-demo.sh
+```
+
+## Manual Fallback
+
+The automated path above is the normal workflow. Use this section only when you
+need to debug or reproduce a setup step by hand.
+
+### Mesh
+
+`mesh-up.sh` puts `wlan0` into IBSS mode with SSID `lnmesh` on frequency `2412`.
+
+```bash
+sudo bash mesh-up.sh 10.0.0.1/24
+sudo systemd-run --no-block --unit=mesh bash /home/akurt/lnmesh/mesh-up.sh 10.0.0.2/24
+sudo systemd-run --no-block --unit=mesh bash /home/akurt/lnmesh/mesh-up.sh 10.0.0.3/24
+```
+
+`systemd-run --no-block` matters on `pi2` and `pi3` because moving `wlan0` from
+normal Wi-Fi to IBSS kills the current SSH session.
+
+After the mesh is up, `pi2` and `pi3` should be reachable from `pi1`:
+
+```bash
+ssh akurt@10.0.0.2
+ssh akurt@10.0.0.3
+```
+
+### Internet Bridge
+
+On `pi1`, enable forwarding and NAT:
+
+```bash
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo nft add table ip nat
+sudo nft "add chain ip nat postrouting { type nat hook postrouting priority 100; }"
+sudo nft add rule ip nat postrouting oifname eth0 masquerade
+```
+
+On `pi2` and `pi3`, route through `pi1`:
+
+```bash
+sudo ip route add default via 10.0.0.1
+sudo rm -f /etc/resolv.conf
+echo "nameserver 1.1.1.1" | sudo tee /etc/resolv.conf
+```
+
+To cut `pi2` and `pi3` off from the internet for offline scenarios:
+
+```bash
+sudo nft delete table ip nat
+```
+
+### Bitcoin Core 31.0
+
+Run on each Pi if Bitcoin Core is missing:
+
+```bash
+cd /tmp
+wget -q https://bitcoincore.org/bin/bitcoin-core-31.0/bitcoin-31.0-aarch64-linux-gnu.tar.gz
+sudo tar -xzf bitcoin-31.0-aarch64-linux-gnu.tar.gz -C /opt/
+sudo ln -sf /opt/bitcoin-31.0/bin/bitcoind /usr/local/bin/
+sudo ln -sf /opt/bitcoin-31.0/bin/bitcoin-cli /usr/local/bin/
+```
+
+Copy the matching config to each Pi:
+
+```bash
+mkdir -p ~/.bitcoin
+cp bitcoin.conf.pi1 ~/.bitcoin/bitcoin.conf
+```
+
+Use `bitcoin.conf.pi2` on `pi2` and `bitcoin.conf.pi3` on `pi3`.
+
+### Core Lightning v26.04.1
+
+Build on `pi1`:
 
 ```bash
 sudo apt-get update
@@ -129,213 +225,98 @@ sudo make install
 sudo strip /usr/local/bin/lightning* /usr/local/libexec/c-lightning/lightning_* /usr/local/libexec/c-lightning/plugins/*
 ```
 
-### On pi2 and pi3 — runtime deps only
+On `pi2` and `pi3`, install runtime dependencies:
 
 ```bash
 sudo apt-get install -y libsodium23 jq
 ```
 
-### Distribute the binaries (from pi1)
-
-Generate an SSH key on pi1 and authorize it on pi2/pi3:
-```bash
-ssh akurt@<PI1_ETH> 'ssh-keygen -t ed25519 -N "" -f ~/.ssh/mesh_key -q'
-PUB=$(ssh akurt@<PI1_ETH> 'cat ~/.ssh/mesh_key.pub')
-for IP in 10.0.0.2 10.0.0.3; do
-  ssh -J akurt@<PI1_ETH> akurt@$IP "echo '$PUB' >> ~/.ssh/authorized_keys"
-done
-```
-
-Tar + scp + untar:
-```bash
-ssh akurt@<PI1_ETH> '
-  sudo tar -cf /tmp/cln.tar -C / \
-    usr/local/bin/lightning-cli \
-    usr/local/bin/lightningd \
-    usr/local/bin/lightning-hsmtool \
-    usr/local/libexec/c-lightning && \
-  sudo chmod a+r /tmp/cln.tar && \
-  scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/mesh_key /tmp/cln.tar akurt@10.0.0.2:/tmp/ && \
-  scp -o StrictHostKeyChecking=accept-new -i ~/.ssh/mesh_key /tmp/cln.tar akurt@10.0.0.3:/tmp/'
-
-for IP in 10.0.0.2 10.0.0.3; do
-  ssh -J akurt@<PI1_ETH> akurt@$IP 'cd / && sudo tar -xf /tmp/cln.tar'
-done
-```
-
-## 8. Configs
+Then tar the CLN binaries on `pi1`, copy them to `pi2` and `pi3`, and extract
+them under `/`:
 
 ```bash
-# Bitcoin (full-mesh peering — different per Pi)
-scp bitcoin.conf.pi1 akurt@<PI1_ETH>:.bitcoin/bitcoin.conf
-scp -J akurt@<PI1_ETH> bitcoin.conf.pi2 akurt@10.0.0.2:.bitcoin/bitcoin.conf
-scp -J akurt@<PI1_ETH> bitcoin.conf.pi3 akurt@10.0.0.3:.bitcoin/bitcoin.conf
-
-# Lightning (same on all)
-ssh akurt@<PI1_ETH> 'mkdir -p ~/.lightning'
-ssh -J akurt@<PI1_ETH> akurt@10.0.0.2 'mkdir -p ~/.lightning'
-ssh -J akurt@<PI1_ETH> akurt@10.0.0.3 'mkdir -p ~/.lightning'
-scp lightningd-config akurt@<PI1_ETH>:.lightning/config
-scp -J akurt@<PI1_ETH> lightningd-config akurt@10.0.0.2:.lightning/config
-scp -J akurt@<PI1_ETH> lightningd-config akurt@10.0.0.3:.lightning/config
+sudo tar -cf /tmp/cln.tar -C / \
+  usr/local/bin/lightning-cli \
+  usr/local/bin/lightningd \
+  usr/local/bin/lightning-hsmtool \
+  usr/local/libexec/c-lightning
+sudo chmod a+r /tmp/cln.tar
+scp /tmp/cln.tar akurt@10.0.0.2:/tmp/
+scp /tmp/cln.tar akurt@10.0.0.3:/tmp/
+ssh akurt@10.0.0.2 'cd / && sudo tar -xf /tmp/cln.tar'
+ssh akurt@10.0.0.3 'cd / && sudo tar -xf /tmp/cln.tar'
 ```
 
-## 9. Start the stack on each Pi
+Copy the shared Lightning config to all three Pis:
 
 ```bash
-# pi1 (Ethernet)
-ssh akurt@<PI1_ETH> 'bitcoind -daemon && bitcoin-cli -regtest -rpcwait getblockchaininfo > /dev/null && lightningd --daemon --network=regtest && sleep 8 && lightning-cli --regtest getinfo | jq "{id, alias, blockheight}"'
-
-# pi2 (over the mesh, jumping through pi1)
-ssh -J akurt@<PI1_ETH> akurt@10.0.0.2 'bitcoind -daemon && bitcoin-cli -regtest -rpcwait getblockchaininfo > /dev/null && lightningd --daemon --network=regtest && sleep 8 && lightning-cli --regtest getinfo | jq "{id, alias, blockheight}"'
-
-# pi3
-ssh -J akurt@<PI1_ETH> akurt@10.0.0.3 'bitcoind -daemon && bitcoin-cli -regtest -rpcwait getblockchaininfo > /dev/null && lightningd --daemon --network=regtest && sleep 8 && lightning-cli --regtest getinfo | jq "{id, alias, blockheight}"'
+mkdir -p ~/.lightning
+cp lightningd-config ~/.lightning/config
 ```
 
-Each command should print that Pi's node ID and `blockheight: 0`.
+### Start And Verify
 
----
-
-# Test scenarios
-
-These all run from your laptop. We use the regtest network — pi1 is the miner, which simulates "the node with internet to the public Bitcoin network".
-
-## Setup — mine + open channels
+On each Pi:
 
 ```bash
-PI1_ETH=192.168.1.152  # YOUR pi1 ethernet IP
-
-# On pi1: create wallet, mine maturity, fund pi1+pi2 LN wallets
-ssh akurt@$PI1_ETH 'bitcoin-cli -regtest createwallet miner'
-PI1_ADDR=$(ssh akurt@$PI1_ETH 'lightning-cli --regtest newaddr | jq -r .bech32')
-PI2_ADDR=$(ssh -J akurt@$PI1_ETH akurt@10.0.0.2 'lightning-cli --regtest newaddr | jq -r .bech32')
-ssh akurt@$PI1_ETH "
-  bitcoin-cli -regtest -rpcwallet=miner generatetoaddress 101 \$(bitcoin-cli -regtest -rpcwallet=miner getnewaddress) > /dev/null
-  bitcoin-cli -regtest -rpcwallet=miner sendtoaddress $PI1_ADDR 0.5
-  bitcoin-cli -regtest -rpcwallet=miner sendtoaddress $PI2_ADDR 0.5
-  bitcoin-cli -regtest -rpcwallet=miner generatetoaddress 1 \$(bitcoin-cli -regtest -rpcwallet=miner getnewaddress) > /dev/null"
-
-# Get LN ids
-PI2_ID=$(ssh -J akurt@$PI1_ETH akurt@10.0.0.2 'lightning-cli --regtest getinfo | jq -r .id')
-PI3_ID=$(ssh -J akurt@$PI1_ETH akurt@10.0.0.3 'lightning-cli --regtest getinfo | jq -r .id')
-
-# Connect peers and open channels: pi1 <-> pi2 <-> pi3
-ssh akurt@$PI1_ETH                       "lightning-cli --regtest connect $PI2_ID@10.0.0.2:9735"
-ssh -J akurt@$PI1_ETH akurt@10.0.0.2     "lightning-cli --regtest connect $PI3_ID@10.0.0.3:9735"
-ssh akurt@$PI1_ETH                       "lightning-cli --regtest fundchannel id=$PI2_ID amount=5000000 mindepth=1"
-ssh -J akurt@$PI1_ETH akurt@10.0.0.2     "lightning-cli --regtest fundchannel id=$PI3_ID amount=5000000 mindepth=1"
-
-sleep 6   # let funding txs propagate over the mesh
-ssh akurt@$PI1_ETH 'bitcoin-cli -regtest -rpcwallet=miner generatetoaddress 6 $(bitcoin-cli -regtest -rpcwallet=miner getnewaddress) > /dev/null'
-sleep 6   # let lightningd lock in
+bitcoind -daemon
+bitcoin-cli -regtest -rpcwait getblockchaininfo
+lightningd --daemon --network=regtest
+sleep 8
+lightning-cli --regtest getinfo | jq "{id, alias, blockheight}"
 ```
 
-Verify channels are `CHANNELD_NORMAL` on every Pi:
-```bash
-for H in "akurt@$PI1_ETH" "-J akurt@$PI1_ETH akurt@10.0.0.2" "-J akurt@$PI1_ETH akurt@10.0.0.3"; do
-  ssh $H 'lightning-cli --regtest listpeerchannels | jq ".channels[] | {state, short_channel_id}"'
-done
-```
-
-## Take pi2/pi3 offline
+After channels are opened, verify they are normal:
 
 ```bash
-ssh akurt@$PI1_ETH 'sudo nft delete table ip nat'   # cuts pi2/pi3 from the internet
+lightning-cli --regtest listpeerchannels | jq ".channels[] | {state, short_channel_id}"
 ```
 
-Verify: `ssh -J akurt@$PI1_ETH akurt@10.0.0.2 'ping -c 1 -W 2 1.1.1.1'` should fail.
+## Offline Scenarios
 
-## Scenario A — multi-hop LN payment, fully offline
+After automated setup, the easiest test is:
 
 ```bash
-INV=$(ssh -J akurt@$PI1_ETH akurt@10.0.0.3 'lightning-cli --regtest invoice amount_msat=1000000 label=A description=offline | jq -r .bolt11')
-ssh akurt@$PI1_ETH "lightning-cli --regtest pay $INV"
+./pay-demo.sh
 ```
-Expected: `status: complete` in ~1 s.
 
-## Scenario B — close + reopen pi2↔pi3 channel while offline
-
-The closing/funding tx for pi2↔pi3 has to be confirmed on chain. With pi2/pi3 offline, the tx hops over the mesh through pi1's bitcoind, which (in regtest) mines it. Neither pi2 nor pi3 has to know that pi1 is the one with chain access — Bitcoin's P2P relay handles it.
+For manual offline payment testing, first remove the NAT bridge on `pi1`:
 
 ```bash
-# Close
-ssh -J akurt@$PI1_ETH akurt@10.0.0.2 "lightning-cli --regtest close $PI3_ID"
-sleep 6
-ssh akurt@$PI1_ETH 'bitcoin-cli -regtest -rpcwallet=miner generatetoaddress 1 $(bitcoin-cli -regtest -rpcwallet=miner getnewaddress) > /dev/null'
-
-# Reopen
-ssh -J akurt@$PI1_ETH akurt@10.0.0.2 "lightning-cli --regtest connect $PI3_ID@10.0.0.3:9735"
-ssh -J akurt@$PI1_ETH akurt@10.0.0.2 "lightning-cli --regtest fundchannel id=$PI3_ID amount=5000000 mindepth=1"
-sleep 6
-ssh akurt@$PI1_ETH 'bitcoin-cli -regtest -rpcwallet=miner generatetoaddress 6 $(bitcoin-cli -regtest -rpcwallet=miner getnewaddress) > /dev/null'
-sleep 6
+sudo nft delete table ip nat
 ```
 
-## Scenario C — late joiner (offline) opens a new channel
-
-Imagine pi3 is a customer who has no channel with pi1 yet, has no internet, and doesn't know which Pi has internet. They just `fundchannel` with pi1; the funding tx propagates via mesh to whoever can mine it.
+Then create an invoice on `pi3` and pay it from `pi1`:
 
 ```bash
-PI3_ADDR=$(ssh -J akurt@$PI1_ETH akurt@10.0.0.3 'lightning-cli --regtest newaddr | jq -r .bech32')
-ssh akurt@$PI1_ETH "
-  bitcoin-cli -regtest -rpcwallet=miner sendtoaddress $PI3_ADDR 0.5
-  bitcoin-cli -regtest -rpcwallet=miner generatetoaddress 1 \$(bitcoin-cli -regtest -rpcwallet=miner getnewaddress) > /dev/null"
-sleep 4
-
-PI1_ID=$(ssh akurt@$PI1_ETH 'lightning-cli --regtest getinfo | jq -r .id')
-ssh -J akurt@$PI1_ETH akurt@10.0.0.3 "lightning-cli --regtest connect $PI1_ID@10.0.0.1:9735"
-ssh -J akurt@$PI1_ETH akurt@10.0.0.3 "lightning-cli --regtest fundchannel id=$PI1_ID amount=5000000 mindepth=1"
-sleep 6
-ssh akurt@$PI1_ETH 'bitcoin-cli -regtest -rpcwallet=miner generatetoaddress 6 $(bitcoin-cli -regtest -rpcwallet=miner getnewaddress) > /dev/null'
-sleep 6
+INV=$(ssh akurt@10.0.0.3 'lightning-cli --regtest invoice amount_msat=1000000 label=A description=offline | jq -r .bolt11')
+lightning-cli --regtest pay "$INV"
 ```
 
-## Scenario D — divergent block heights converge
+Expected result: `status: complete`.
 
-Simulates one community member losing internet earlier than the others. Their bitcoind sees fewer blocks; once back on the mesh, it catches up via P2P.
+## Gotchas
 
-```bash
-# Isolate pi2's bitcoind from the network
-ssh -J akurt@$PI1_ETH akurt@10.0.0.2 'bitcoin-cli -regtest setnetworkactive false'
+- Discovery requires `pi2` and `pi3` to still be on normal Wi-Fi before
+  `gateway-setup.sh` starts.
+- Hostnames are expected to be exactly `pi1`, `pi2`, and `pi3`.
+- The automation is fixed to the 3-Pi regtest topology.
+- Reboot persistence is not installed. If a Pi reboots, rerun setup/start steps.
+- Tx propagation over IBSS is 5-10 seconds, not instant. Mine after propagation,
+  or the miner block may be empty.
+- Bitcoind restart unloads wallets. Run `bitcoin-cli -regtest loadwallet miner`
+  after restarts, or add `wallet=miner` to `bitcoin.conf`.
+- The built-in Pi Wi-Fi driver supports IBSS, but not 802.11s mesh point mode.
+  For real 802.11s mesh, use a compatible USB Wi-Fi adapter.
+- Pass `--regtest` to `lightning-cli`. The CLI chooses the RPC socket based on
+  the network flag.
 
-# Mine 5 blocks on pi1 — pi3 stays in sync (still peered), pi2 falls behind
-ssh akurt@$PI1_ETH 'bitcoin-cli -regtest -rpcwallet=miner generatetoaddress 5 $(bitcoin-cli -regtest -rpcwallet=miner getnewaddress) > /dev/null'
-
-# Reconnect pi2 + force immediate dial (bitcoind otherwise backs off)
-ssh -J akurt@$PI1_ETH akurt@10.0.0.2 'bitcoin-cli -regtest setnetworkactive true && \
-  bitcoin-cli -regtest addnode 10.0.0.1 onetry && \
-  bitcoin-cli -regtest addnode 10.0.0.3 onetry'
-sleep 5
-
-# All three should now be at the same height
-for H in "akurt@$PI1_ETH" "-J akurt@$PI1_ETH akurt@10.0.0.2" "-J akurt@$PI1_ETH akurt@10.0.0.3"; do
-  ssh $H 'bitcoin-cli -regtest getblockcount'
-done
-```
-
-## Restore the bridge
-
-```bash
-ssh akurt@$PI1_ETH 'sudo nft add table ip nat && \
-  sudo nft "add chain ip nat postrouting { type nat hook postrouting priority 100; }" && \
-  sudo nft add rule ip nat postrouting oifname eth0 masquerade'
-```
-
----
-
-# Gotchas
-
-- **Tx propagation over IBSS is 5–10 s, not instant.** Always `sleep ~6` after `fundchannel` / `close` before mining, or the miner block will be empty and you'll need to mine again. On testnet/mainnet this is invisible (real block intervals are minutes).
-- **Bitcoind restart unloads wallets.** Run `bitcoin-cli -regtest loadwallet miner` after restarts, or add `wallet=miner` to `bitcoin.conf` for auto-load.
-- **Pi's built-in Wi-Fi (brcmfmac) doesn't support 802.11s.** That's why we use IBSS via `mesh-up.sh`. For real 802.11s mesh you'd need a USB Wi-Fi adapter with an Atheros (`ath9k_htc`) or Ralink (`rt2800usb`) chipset.
-- **`mesh-up.sh` doesn't enable on boot.** If you reboot a Pi, run the script again. (Adding a systemd unit is left as an exercise.)
-- **Pass `--regtest` to `lightning-cli` every time.** The CLI looks for the RPC socket based on the `--network` flag.
-
-# File reference
+## File Reference
 
 | File | What it is |
 |---|---|
-| `mesh-up.sh` | IBSS setup script — run on each Pi with its mesh IP |
-| `bitcoin.conf.pi{1,2,3}` | Per-Pi bitcoind config (full-mesh peering) |
-| `lightningd-config` | Shared lightningd config (regtest, listens on `0.0.0.0:9735`) |
+| `gateway-setup.sh` | Gateway automation entrypoint |
+| `pay-demo.sh` | One-command demo payment helper |
+| `mesh-up.sh` | IBSS setup script; run on each Pi with its mesh IP |
+| `bitcoin.conf.pi{1,2,3}` | Per-Pi bitcoind config for full-mesh regtest peering |
+| `lightningd-config` | Shared lightningd config for regtest on `0.0.0.0:9735` |
