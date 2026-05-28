@@ -83,6 +83,14 @@ If LAN discovery cannot find `pi2` or `pi3`, pass their current Wi-Fi IPs:
 ./gateway-setup.sh --user akurt --node pi2=192.168.1.23 --node pi3=192.168.1.24
 ```
 
+If a previous run already moved `pi2` and `pi3` onto the mesh, rerun the same
+command from `pi1`. The script checks the expected mesh IPs before failing
+discovery:
+
+```bash
+./gateway-setup.sh --user akurt --node pi2=10.0.0.2 --node pi3=10.0.0.3
+```
+
 If `pi1`'s Ethernet interface is not `eth0`, name the uplink explicitly:
 
 ```bash
@@ -105,16 +113,28 @@ Command reference:
 Use `--foreground` only when debugging from a local console. The default
 detached mode is safer over SSH.
 
+Remote SSH operations have timeouts so one stuck command cannot hold the whole
+setup forever. Long remote commands default to 3600 seconds, daemon recovery
+defaults to 300 seconds, and failures name the host and command that failed:
+
+```bash
+LNMESH_SSH_TIMEOUT=5400 LNMESH_DAEMON_START_TIMEOUT=420 ./gateway-setup.sh --user akurt
+```
+
 ### What The Script Does
 
 `gateway-setup.sh` automates the long manual setup:
 
 - Discovers `pi2` and `pi3` on the normal Wi-Fi network.
+- On reruns, reuses `pi2=10.0.0.2` and `pi3=10.0.0.3` if they are already on
+  the mesh.
 - Ensures local passwordless sudo on `pi1` for the detached worker.
 - Installs a gateway SSH key and passwordless sudo on the node Pis.
 - Verifies passwordless sudo on all three Pis before long downloads/builds.
 - Moves all three Pis into IBSS/ad-hoc Wi-Fi mesh mode.
 - Shows per-Pi progress bars in `~/.lnmesh/gateway-setup.log`.
+- Wraps remote SSH/SCP commands in timeouts and logs the exact host being
+  worked on.
 - Assigns mesh IPs:
   - `pi1`: `10.0.0.1/24`
   - `pi2`: `10.0.0.2/24`
@@ -124,7 +144,10 @@ detached mode is safer over SSH.
 - Builds Core Lightning v26.04.1 on `pi1` and copies the binaries to `pi2` and
   `pi3`.
 - Writes Bitcoin and Lightning configs.
-- Starts `bitcoind` and `lightningd`.
+- Starts or recovers `bitcoind` and `lightningd` with detached stdio so daemon
+  children do not hold SSH sessions open.
+- Validates Bitcoin and Lightning RPC on `pi1`, `pi2`, and `pi3` before channel
+  setup.
 - Creates or loads the regtest `miner` wallet on `pi1`.
 - Mines maturity blocks, funds CLN wallets, and opens the `pi1 <-> pi2` and
   `pi2 <-> pi3` channels.
@@ -291,12 +314,15 @@ cp lightningd-config ~/.lightning/config
 On each Pi:
 
 ```bash
-bitcoind -daemon
+nohup bitcoind -daemon </dev/null >/tmp/lnmesh-bitcoind-start.log 2>&1
 bitcoin-cli -regtest -rpcwait getblockchaininfo
-lightningd --daemon --network=regtest
-sleep 8
+nohup lightningd --daemon --network=regtest </dev/null >/tmp/lnmesh-lightningd-start.log 2>&1
 lightning-cli --regtest getinfo | jq "{id, alias, blockheight}"
 ```
+
+The redirection matters when these commands are run through SSH. It prevents a
+daemon child process from keeping the SSH session open after the useful command
+has already finished.
 
 After channels are opened, verify they are normal:
 
@@ -329,10 +355,13 @@ Expected result: `status: complete`.
 
 ## Gotchas
 
-- Discovery requires `pi2` and `pi3` to still be on normal Wi-Fi before
-  `gateway-setup.sh` starts.
+- Fresh discovery requires `pi2` and `pi3` to still be on normal Wi-Fi before
+  `gateway-setup.sh` starts. Reruns can resume from the expected mesh IPs if
+  `pi2=10.0.0.2` and `pi3=10.0.0.3` are reachable from `pi1`.
 - SSH sessions can drop when `wlan0` is moved into IBSS mode. The setup runs
   detached by default; use `tail -f ~/.lnmesh/gateway-setup.log` after reconnecting.
+- Remote commands are timed. If a command times out, the log names the host and
+  the command preview before setup exits.
 - The automation intentionally uses `sudo -n` after bootstrap. If passwordless
   sudo is not working on any Pi, setup fails early instead of hanging on a
   password prompt.

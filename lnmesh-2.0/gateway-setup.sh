@@ -16,6 +16,9 @@ STATE_FILE="${STATE_DIR}/lnmesh-2.0.env"
 LOG_FILE="${STATE_DIR}/gateway-setup.log"
 PID_FILE="${STATE_DIR}/gateway-setup.pid"
 DEFAULT_PAYMENT_MSAT="${LNMESH_PAYMENT_MSAT:-1000000}"
+SSH_TIMEOUT="${LNMESH_SSH_TIMEOUT:-3600}"
+SSH_SHORT_TIMEOUT="${LNMESH_SSH_SHORT_TIMEOUT:-45}"
+SSH_DAEMON_TIMEOUT="${LNMESH_DAEMON_START_TIMEOUT:-300}"
 
 declare -A NODE_WIFI_HOST=()
 declare -A NODE_MESH_IP=([pi1]="10.0.0.1" [pi2]="10.0.0.2" [pi3]="10.0.0.3")
@@ -23,12 +26,16 @@ declare -A NODE_MESH_CIDR=([pi1]="10.0.0.1/24" [pi2]="10.0.0.2/24" [pi3]="10.0.0
 declare -A NODE_BTC_CONF=([pi1]="bitcoin.conf.pi1" [pi2]="bitcoin.conf.pi2" [pi3]="bitcoin.conf.pi3")
 declare -A NODE_PROGRESS=([pi1]=0 [pi2]=0 [pi3]=0)
 declare -A NODE_STATUS=([pi1]="queued" [pi2]="queued" [pi3]="queued")
+declare -A NODE_ON_MESH=([pi2]=0 [pi3]=0)
+declare -A NODE_BASE_DEPS_READY=([pi2]=0 [pi3]=0)
 PROGRESS_WIDTH=28
 
 SSH_COMMON_OPTS=(
   -o StrictHostKeyChecking=accept-new
   -o UserKnownHostsFile="${HOME}/.ssh/known_hosts"
   -o ConnectTimeout=8
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=2
 )
 
 usage() {
@@ -37,8 +44,9 @@ Usage:
   ./gateway-setup.sh [--user akurt] [--node-password PASSWORD] [--node pi2=HOST --node pi3=HOST] [--dry-run] [--foreground]
 
 Runs on pi1 from the lnmesh-2.0 directory. It discovers pi2/pi3 on normal
-Wi-Fi, moves the three Pis onto the IBSS mesh, installs Bitcoin Core/Core
-Lightning, starts regtest daemons, funds wallets, and opens the demo channels.
+Wi-Fi or resumes from their expected mesh IPs, moves the three Pis onto the
+IBSS mesh, installs Bitcoin Core/Core Lightning, starts regtest daemons, funds
+wallets, and opens the demo channels.
 By default, the real setup runs detached so it survives SSH drops when wlan0
 switches into IBSS mode. Use --foreground only for debugging from a local console.
 
@@ -46,11 +54,18 @@ Environment:
   LNMESH_NODE_PASSWORD   Shared Pi password, used once for bootstrap.
   LNMESH_PAYMENT_MSAT    Default amount written for pay-demo.sh.
   LNMESH_UPLINK_IFACE    Gateway uplink for NAT, default: eth0.
+  LNMESH_SSH_TIMEOUT     Timeout for long remote SSH commands, default: 3600.
+  LNMESH_DAEMON_START_TIMEOUT
+                         Timeout for remote daemon recovery, default: 300.
 EOF
 }
 
 log() {
   printf '[lnmesh-setup] %s\n' "$*"
+}
+
+log_stderr() {
+  printf '[lnmesh-setup] %s\n' "$*" >&2
 }
 
 progress_bar() {
@@ -102,6 +117,52 @@ quote() {
   printf '%q' "$1"
 }
 
+redact_secrets() {
+  local text="$1"
+  if [[ -n "${NODE_PASSWORD:-}" ]]; then
+    text="${text//"$NODE_PASSWORD"/********}"
+  fi
+  printf '%s' "$text"
+}
+
+command_preview() {
+  local cmd="$1"
+  cmd="$(redact_secrets "$cmd")"
+  cmd="${cmd//$'\n'/; }"
+  if ((${#cmd} > 220)); then
+    printf '%s...' "${cmd:0:220}"
+  else
+    printf '%s' "$cmd"
+  fi
+}
+
+run_timed() {
+  local seconds="$1"
+  shift
+  command -v timeout >/dev/null 2>&1 || die "timeout command not found; install coreutils before running setup"
+  timeout --kill-after=10s "$seconds" "$@"
+}
+
+is_timeout_status() {
+  case "$1" in
+    124|137|143) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+remote_command_failed() {
+  local label="$1"
+  local host="$2"
+  local seconds="$3"
+  local cmd="$4"
+  local status="$5"
+
+  if is_timeout_status "$status"; then
+    die "${label} timed out after ${seconds}s on ${host}: $(command_preview "$cmd")"
+  fi
+  die "${label} failed with exit ${status} on ${host}: $(command_preview "$cmd")"
+}
+
 run() {
   log "+ $*"
   if [[ "$DRY_RUN" == "1" ]]; then
@@ -131,31 +192,56 @@ run_sudo_bash() {
 ssh_password() {
   local host="$1"
   local cmd="$2"
+  local seconds="${3:-$SSH_TIMEOUT}"
+  local status=0
   if [[ "$DRY_RUN" == "1" ]]; then
-    log "+ sshpass -p ******** ssh ${LNMESH_USER}@${host} ${cmd}"
+    log "+ timeout ${seconds}s sshpass -p ******** ssh ${LNMESH_USER}@${host} $(command_preview "$cmd")"
     return 0
   fi
-  sshpass -p "$NODE_PASSWORD" ssh "${SSH_COMMON_OPTS[@]}" "${LNMESH_USER}@${host}" "$cmd"
+  run_timed "$seconds" sshpass -p "$NODE_PASSWORD" ssh "${SSH_COMMON_OPTS[@]}" "${LNMESH_USER}@${host}" "$cmd" || status=$?
+  if ((status != 0)); then
+    remote_command_failed "password SSH command" "$host" "$seconds" "$cmd" "$status"
+  fi
+}
+
+ssh_key_raw() {
+  local host="$1"
+  local cmd="$2"
+  local seconds="${3:-$SSH_TIMEOUT}"
+  run_timed "$seconds" ssh -i "$KEY_PATH" -o BatchMode=yes "${SSH_COMMON_OPTS[@]}" "${LNMESH_USER}@${host}" "$cmd"
 }
 
 ssh_key() {
   local host="$1"
   local cmd="$2"
-  log "+ ssh -i ${KEY_PATH} ${LNMESH_USER}@${host} ${cmd}"
+  local seconds="${3:-$SSH_TIMEOUT}"
+  local status=0
+  log "+ timeout ${seconds}s ssh -i ${KEY_PATH} ${LNMESH_USER}@${host} $(command_preview "$cmd")"
   if [[ "$DRY_RUN" == "1" ]]; then
     return 0
   fi
-  ssh -i "$KEY_PATH" "${SSH_COMMON_OPTS[@]}" "${LNMESH_USER}@${host}" "$cmd"
+  ssh_key_raw "$host" "$cmd" "$seconds" || status=$?
+  if ((status != 0)); then
+    remote_command_failed "key SSH command" "$host" "$seconds" "$cmd" "$status"
+  fi
 }
 
 scp_key() {
   local src="$1"
   local dest="$2"
-  log "+ scp -i ${KEY_PATH} ${src} ${dest}"
+  local seconds="${3:-$SSH_TIMEOUT}"
+  local status=0
+  log "+ timeout ${seconds}s scp -i ${KEY_PATH} ${src} ${dest}"
   if [[ "$DRY_RUN" == "1" ]]; then
     return 0
   fi
-  scp -i "$KEY_PATH" "${SSH_COMMON_OPTS[@]}" "$src" "$dest"
+  run_timed "$seconds" scp -i "$KEY_PATH" -o BatchMode=yes "${SSH_COMMON_OPTS[@]}" "$src" "$dest" || status=$?
+  if ((status != 0)); then
+    if is_timeout_status "$status"; then
+      die "scp timed out after ${seconds}s: ${src} -> ${dest}"
+    fi
+    die "scp failed with exit ${status}: ${src} -> ${dest}"
+  fi
 }
 
 remote_sudo_password() {
@@ -325,7 +411,7 @@ install_gateway_dependencies() {
   local tool pkg_string
   progress_node pi1 4 "checking gateway packages"
 
-  for tool in nmap sshpass jq wget curl tar iw rfkill nft ip ping; do
+  for tool in nmap sshpass jq wget curl tar iw rfkill nft ip ping timeout; do
     if ! command -v "$tool" >/dev/null 2>&1; then
       missing+=("$tool")
     fi
@@ -337,7 +423,7 @@ install_gateway_dependencies() {
     return
   fi
 
-  pkg_string="nmap sshpass jq wget curl tar iw rfkill nftables iproute2 iputils-ping"
+  pkg_string="nmap sshpass jq wget curl tar iw rfkill nftables iproute2 iputils-ping coreutils"
   progress_node pi1 5 "downloading gateway packages"
   run_sudo_bash "apt-get update && apt-get install -y ${pkg_string}"
   progress_node pi1 8 "gateway packages ready"
@@ -354,12 +440,39 @@ validate_uplink() {
   progress_node pi1 10 "uplink ${UPLINK_IFACE} ready"
 }
 
-probe_hostname() {
+probe_hostname_key() {
   local host="$1"
+  local status=0 output
+  [[ -f "$KEY_PATH" ]] || return 1
   if [[ "$DRY_RUN" == "1" ]]; then
     return 1
   fi
-  sshpass -p "$NODE_PASSWORD" ssh "${SSH_COMMON_OPTS[@]}" "${LNMESH_USER}@${host}" 'hostname -s' 2>/dev/null | tr -d '\r'
+  output="$(ssh_key_raw "$host" 'hostname -s' "$SSH_SHORT_TIMEOUT" 2>/dev/null)" || status=$?
+  ((status == 0)) || return "$status"
+  printf '%s\n' "$output" | tr -d '\r' | awk 'NR == 1 {print; exit}'
+}
+
+probe_hostname_password() {
+  local host="$1"
+  local status=0 output
+  [[ -n "$NODE_PASSWORD" ]] || return 1
+  if [[ "$DRY_RUN" == "1" ]]; then
+    return 1
+  fi
+  output="$(run_timed "$SSH_SHORT_TIMEOUT" sshpass -p "$NODE_PASSWORD" ssh "${SSH_COMMON_OPTS[@]}" "${LNMESH_USER}@${host}" 'hostname -s' 2>/dev/null)" || status=$?
+  ((status == 0)) || return "$status"
+  printf '%s\n' "$output" | tr -d '\r' | awk 'NR == 1 {print; exit}'
+}
+
+probe_hostname() {
+  local host="$1"
+  local found=""
+  found="$(probe_hostname_key "$host" || true)"
+  if [[ -n "$found" ]]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  probe_hostname_password "$host"
 }
 
 try_known_hostnames() {
@@ -371,8 +484,44 @@ try_known_hostnames() {
     found_name="$(probe_hostname "$ip" || true)"
     if [[ "$found_name" == "$node" ]]; then
       NODE_WIFI_HOST["$node"]="$ip"
+      [[ "$ip" == "${NODE_MESH_IP[$node]}" ]] && NODE_ON_MESH["$node"]=1
       log "found ${node} at ${ip} via hostname lookup"
     fi
+  done
+}
+
+mark_supplied_mesh_nodes() {
+  local node
+  for node in pi2 pi3; do
+    if [[ "${NODE_WIFI_HOST[$node]:-}" == "${NODE_MESH_IP[$node]}" ]]; then
+      NODE_ON_MESH["$node"]=1
+      log "${node} was supplied as its mesh IP ${NODE_MESH_IP[$node]}; treating it as already on mesh"
+    fi
+  done
+}
+
+try_existing_mesh_nodes() {
+  local node ip found_name
+  for node in pi2 pi3; do
+    [[ -z "${NODE_WIFI_HOST[$node]:-}" ]] || continue
+    ip="${NODE_MESH_IP[$node]}"
+    log "checking whether ${node} is already on mesh at ${ip}"
+    if ! ping -c 1 -W 2 "$ip" >/dev/null 2>&1; then
+      continue
+    fi
+
+    found_name="$(probe_hostname "$ip" || true)"
+    if [[ "$found_name" == "$node" ]]; then
+      log "found ${node} already on mesh at ${ip}"
+    elif [[ -n "$found_name" ]]; then
+      log "${ip} answered SSH as ${found_name}; expected ${node}, so not using it"
+      continue
+    else
+      log "${ip} is pingable but SSH hostname could not be verified; trying it as ${node} for resume"
+    fi
+
+    NODE_WIFI_HOST["$node"]="$ip"
+    NODE_ON_MESH["$node"]=1
   done
 }
 
@@ -388,6 +537,8 @@ lan_cidr() {
 discover_nodes() {
   local cidr ip found_name
 
+  mark_supplied_mesh_nodes
+
   if [[ -n "${NODE_WIFI_HOST[pi2]:-}" && -n "${NODE_WIFI_HOST[pi3]:-}" ]]; then
     log "using manually supplied node addresses: pi2=${NODE_WIFI_HOST[pi2]}, pi3=${NODE_WIFI_HOST[pi3]}"
     progress_node pi2 10 "discovered at ${NODE_WIFI_HOST[pi2]}"
@@ -400,8 +551,11 @@ discover_nodes() {
   fi
 
   try_known_hostnames
+  try_existing_mesh_nodes
 
   if [[ -n "${NODE_WIFI_HOST[pi2]:-}" && -n "${NODE_WIFI_HOST[pi3]:-}" ]]; then
+    progress_node pi2 10 "discovered at ${NODE_WIFI_HOST[pi2]}"
+    progress_node pi3 10 "discovered at ${NODE_WIFI_HOST[pi3]}"
     return
   fi
 
@@ -414,13 +568,20 @@ discover_nodes() {
     case "$found_name" in
       pi2|pi3)
         NODE_WIFI_HOST["$found_name"]="$ip"
+        if [[ "$ip" == "${NODE_MESH_IP[$found_name]}" ]]; then
+          NODE_ON_MESH["$found_name"]=1
+        else
+          NODE_ON_MESH["$found_name"]=0
+        fi
         log "found ${found_name} at ${ip}"
         ;;
     esac
   done < <(nmap -n -p 22 --open "$cidr" -oG - 2>/dev/null | awk '/Ports: 22\/open/ {print $2}')
 
-  [[ -n "${NODE_WIFI_HOST[pi2]:-}" ]] || die "could not discover pi2; rerun with --node pi2=HOST"
-  [[ -n "${NODE_WIFI_HOST[pi3]:-}" ]] || die "could not discover pi3; rerun with --node pi3=HOST"
+  try_existing_mesh_nodes
+
+  [[ -n "${NODE_WIFI_HOST[pi2]:-}" ]] || die "could not discover pi2 on normal Wi-Fi or mesh IP ${NODE_MESH_IP[pi2]}; rerun with --node pi2=HOST"
+  [[ -n "${NODE_WIFI_HOST[pi3]:-}" ]] || die "could not discover pi3 on normal Wi-Fi or mesh IP ${NODE_MESH_IP[pi3]}; rerun with --node pi3=HOST"
   progress_node pi2 10 "discovered at ${NODE_WIFI_HOST[pi2]}"
   progress_node pi3 10 "discovered at ${NODE_WIFI_HOST[pi3]}"
 }
@@ -476,9 +637,28 @@ bootstrap_nodes() {
 install_node_base_dependencies() {
   local node
   for node in pi2 pi3; do
+    if [[ "${NODE_ON_MESH[$node]}" == "1" ]]; then
+      log "${node} is already on mesh; deferring base package check until pi1 bridge is configured"
+      progress_node "$node" 25 "base mesh packages deferred until bridge"
+      continue
+    fi
     progress_node "$node" 20 "downloading base mesh packages"
     remote_sudo_key "${NODE_WIFI_HOST[$node]}" "apt-get update && apt-get install -y iw rfkill wget curl tar jq"
+    NODE_BASE_DEPS_READY["$node"]=1
     progress_node "$node" 25 "base mesh packages ready"
+  done
+}
+
+ensure_deferred_node_base_dependencies() {
+  local node
+  for node in pi2 pi3; do
+    if [[ "${NODE_BASE_DEPS_READY[$node]}" == "1" ]]; then
+      continue
+    fi
+    progress_node "$node" 41 "checking/installing base packages over mesh"
+    remote_sudo_key "${NODE_MESH_IP[$node]}" "apt-get update && apt-get install -y iw rfkill wget curl tar jq"
+    NODE_BASE_DEPS_READY["$node"]=1
+    progress_node "$node" 42 "base mesh packages ready"
   done
 }
 
@@ -505,23 +685,39 @@ copy_mesh_script_to_nodes() {
   done
 }
 
+local_mesh_ready() {
+  ip -o -4 addr show dev wlan0 2>/dev/null | awk '{print $4}' | grep -Fxq "${NODE_MESH_CIDR[pi1]}"
+}
+
 start_mesh() {
   local node host unit
 
   copy_mesh_script_to_nodes
 
   for node in pi2 pi3; do
+    if [[ "${NODE_ON_MESH[$node]}" == "1" ]]; then
+      log "${node} already appears to be on mesh at ${NODE_MESH_IP[$node]}; not re-running mesh-up remotely"
+      progress_node "$node" 30 "already on mesh"
+      continue
+    fi
     host="${NODE_WIFI_HOST[$node]}"
     unit="lnmesh-mesh-${node}-$(date +%s)"
     progress_node "$node" 30 "switching wlan0 to IBSS mesh"
     remote_sudo_key "$host" "systemd-run --no-block --unit=${unit} bash /home/${LNMESH_USER}/lnmesh/mesh-up.sh ${NODE_MESH_CIDR[$node]}"
   done
 
-  progress_node pi1 30 "switching wlan0 to IBSS mesh"
-  run_sudo_bash "bash $(quote "${SCRIPT_DIR}/mesh-up.sh") ${NODE_MESH_CIDR[pi1]}"
+  if [[ "$DRY_RUN" == "0" ]] && local_mesh_ready; then
+    log "pi1 already has mesh IP ${NODE_MESH_CIDR[pi1]}; not re-running mesh-up locally"
+    progress_node pi1 30 "already on mesh"
+  else
+    progress_node pi1 30 "switching wlan0 to IBSS mesh"
+    run_sudo_bash "bash $(quote "${SCRIPT_DIR}/mesh-up.sh") ${NODE_MESH_CIDR[pi1]}"
+  fi
   wait_for_mesh_node pi2
+  NODE_ON_MESH[pi2]=1
   progress_node pi2 35 "mesh reachable at ${NODE_MESH_IP[pi2]}"
   wait_for_mesh_node pi3
+  NODE_ON_MESH[pi3]=1
   progress_node pi3 35 "mesh reachable at ${NODE_MESH_IP[pi3]}"
   progress_node pi1 35 "mesh IP ${NODE_MESH_IP[pi1]} ready"
 }
@@ -682,27 +878,145 @@ write_configs() {
 
 start_stack_cmd() {
   cat <<'EOF'
-set -e
-bitcoind -daemon 2>/dev/null || true
-bitcoin-cli -regtest -rpcwait getblockchaininfo >/dev/null
-if ! lightning-cli --regtest getinfo >/dev/null 2>&1; then
-  lightningd --daemon --network=regtest
+set -euo pipefail
+
+host="$(hostname -s 2>/dev/null || hostname)"
+bitcoin_start_log="${TMPDIR:-/tmp}/lnmesh-bitcoind-start.log"
+lightning_start_log="${TMPDIR:-/tmp}/lnmesh-lightningd-start.log"
+lightning_info_json="${TMPDIR:-/tmp}/lnmesh-lightning-getinfo.json"
+lightning_info_err="${TMPDIR:-/tmp}/lnmesh-lightning-getinfo.err"
+
+remote_log() {
+  printf '[lnmesh-daemon:%s] %s\n' "$host" "$*"
+}
+
+run_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$@"
+  else
+    shift
+    "$@"
+  fi
+}
+
+remote_log "starting bitcoind: checking RPC"
+if bitcoin-cli -regtest getblockchaininfo >/dev/null 2>&1; then
+  remote_log "bitcoind already responding"
+else
+  remote_log "starting bitcoind with detached stdio"
+  mkdir -p "$HOME/.bitcoin"
+  : >"$bitcoin_start_log"
+  nohup bitcoind -daemon </dev/null >"$bitcoin_start_log" 2>&1 || true
 fi
-sleep 8
-lightning-cli --regtest getinfo | jq '{id, alias, blockheight}'
+
+remote_log "waiting for bitcoin-cli -rpcwait"
+if ! run_timeout 180 bitcoin-cli -regtest -rpcwait getblockchaininfo >/dev/null; then
+  remote_log "bitcoin RPC did not become ready"
+  tail -n 80 "$bitcoin_start_log" 2>/dev/null || true
+  exit 1
+fi
+remote_log "bitcoin RPC ready"
+
+remote_log "starting lightningd: checking RPC"
+if lightning-cli --regtest getinfo >/dev/null 2>&1; then
+  remote_log "lightningd already responding"
+else
+  remote_log "starting lightningd with detached stdio"
+  mkdir -p "$HOME/.lightning"
+  : >"$lightning_start_log"
+  nohup lightningd --daemon --network=regtest </dev/null >"$lightning_start_log" 2>&1 || true
+fi
+
+remote_log "running lightning-cli getinfo"
+for attempt in $(seq 1 60); do
+  if lightning-cli --regtest getinfo >"$lightning_info_json" 2>"$lightning_info_err"; then
+    remote_log "lightningd RPC ready"
+    jq '{id, alias, blockheight}' "$lightning_info_json"
+    exit 0
+  fi
+  sleep 2
+done
+
+remote_log "lightningd RPC did not become ready"
+tail -n 80 "$lightning_start_log" 2>/dev/null || true
+tail -n 80 "$lightning_info_err" 2>/dev/null || true
+exit 1
 EOF
 }
 
-start_stack() {
-  local cmd node
+start_stack_node() {
+  local node="$1"
+  local cmd host
   cmd="$(start_stack_cmd)"
-  progress_node pi1 86 "starting bitcoind and lightningd"
-  run_bash "$cmd"
-  progress_node pi1 90 "daemons running"
-  for node in pi2 pi3; do
-    progress_node "$node" 86 "starting bitcoind and lightningd"
-    ssh_key "${NODE_MESH_IP[$node]}" "$cmd"
-    progress_node "$node" 90 "daemons running"
+
+  progress_node "$node" 86 "starting/recovering bitcoind and lightningd"
+  if [[ "$node" == "pi1" ]]; then
+    log "${node} (${NODE_MESH_IP[$node]}): starting/recovering bitcoind and lightningd"
+    run_bash "$cmd"
+  else
+    host="${NODE_MESH_IP[$node]}"
+    log "${node} (${host}): starting/recovering bitcoind and lightningd"
+    ssh_key "$host" "$cmd" "$SSH_DAEMON_TIMEOUT"
+  fi
+  progress_node "$node" 90 "daemons running"
+}
+
+start_stack() {
+  start_stack_node pi1
+  log "moving daemon startup from pi1 to pi2"
+  start_stack_node pi2
+  log "moving daemon startup from pi2 to pi3"
+  start_stack_node pi3
+}
+
+stack_ready_cmd() {
+  cat <<'EOF'
+set -e
+bitcoin-cli -regtest getblockchaininfo >/dev/null
+lightning-cli --regtest getinfo >/dev/null
+EOF
+}
+
+stack_ready_node() {
+  local node="$1"
+  local cmd status=0
+  cmd="$(stack_ready_cmd)"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "+ validate Bitcoin/Lightning daemons on ${node}"
+    return 0
+  fi
+
+  if [[ "$node" == "pi1" ]]; then
+    bash -lc "$cmd" >/dev/null 2>&1 || status=$?
+  else
+    ssh_key_raw "${NODE_MESH_IP[$node]}" "$cmd" "$SSH_SHORT_TIMEOUT" >/dev/null 2>&1 || status=$?
+    if is_timeout_status "$status"; then
+      remote_command_failed "daemon validation" "${NODE_MESH_IP[$node]}" "$SSH_SHORT_TIMEOUT" "$cmd" "$status"
+    fi
+  fi
+
+  return "$status"
+}
+
+validate_stack_ready() {
+  local node status
+  for node in pi1 pi2 pi3; do
+    progress_node "$node" 91 "validating Bitcoin and Lightning RPC"
+    status=0
+    stack_ready_node "$node" || status=$?
+    if ((status == 0)); then
+      log "${node} (${NODE_MESH_IP[$node]}): Bitcoin and Lightning RPC are ready"
+      progress_node "$node" 91 "Bitcoin and Lightning RPC ready"
+      continue
+    fi
+
+    log "${node} (${NODE_MESH_IP[$node]}): daemon validation failed with exit ${status}; attempting recovery"
+    start_stack_node "$node"
+    status=0
+    stack_ready_node "$node" || status=$?
+    ((status == 0)) || die "${node} daemons are still not ready after recovery"
+    progress_node "$node" 91 "Bitcoin and Lightning RPC recovered"
   done
 }
 
@@ -719,12 +1033,20 @@ local_json() {
 remote_json() {
   local node="$1"
   local cmd="$2"
+  local seconds="${3:-$SSH_SHORT_TIMEOUT}"
+  local host="${NODE_MESH_IP[$node]}"
+  local status=0 output
   if [[ "$DRY_RUN" == "1" ]]; then
     log "+ ssh ${node} ${cmd}"
     printf '{}\n'
     return
   fi
-  ssh -i "$KEY_PATH" "${SSH_COMMON_OPTS[@]}" "${LNMESH_USER}@${NODE_MESH_IP[$node]}" "$cmd"
+  log_stderr "+ timeout ${seconds}s ssh -i ${KEY_PATH} ${LNMESH_USER}@${host} $(command_preview "$cmd")"
+  output="$(ssh_key_raw "$host" "$cmd" "$seconds")" || status=$?
+  if ((status != 0)); then
+    remote_command_failed "remote JSON command" "$host" "$seconds" "$cmd" "$status"
+  fi
+  printf '%s\n' "$output"
 }
 
 ensure_miner_wallet() {
@@ -746,9 +1068,23 @@ channel_exists_local() {
 channel_exists_remote() {
   local node="$1"
   local peer_id="$2"
+  local cmd status=0
   [[ "$DRY_RUN" == "1" ]] && return 1
-  ssh -i "$KEY_PATH" "${SSH_COMMON_OPTS[@]}" "${LNMESH_USER}@${NODE_MESH_IP[$node]}" \
-    "lightning-cli --regtest listpeerchannels | jq -e --arg peer ${peer_id@Q} '.channels[]? | select(.peer_id == \$peer and .state != \"CLOSED\" and .state != \"ONCHAIN\")' >/dev/null"
+  cmd="lightning-cli --regtest listpeerchannels | jq -e --arg peer ${peer_id@Q} '.channels[]? | select(.peer_id == \$peer and .state != \"CLOSED\" and .state != \"ONCHAIN\")' >/dev/null"
+  ssh_key_raw "${NODE_MESH_IP[$node]}" "$cmd" "$SSH_SHORT_TIMEOUT" >/dev/null || status=$?
+  case "$status" in
+    0) return 0 ;;
+    1) return 1 ;;
+    124|137|143)
+      remote_command_failed "remote channel check" "${NODE_MESH_IP[$node]}" "$SSH_SHORT_TIMEOUT" "$cmd" "$status"
+      ;;
+    255)
+      remote_command_failed "remote channel check" "${NODE_MESH_IP[$node]}" "$SSH_SHORT_TIMEOUT" "$cmd" "$status"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 wait_channel_normal_local() {
@@ -768,12 +1104,17 @@ wait_channel_normal_local() {
 wait_channel_normal_remote() {
   local node="$1"
   local peer_id="$2"
-  local attempt
+  local attempt cmd status
   [[ "$DRY_RUN" == "1" ]] && return 0
+  cmd="lightning-cli --regtest listpeerchannels | jq -e --arg peer ${peer_id@Q} '.channels[]? | select(.peer_id == \$peer and .state == \"CHANNELD_NORMAL\")' >/dev/null"
   for attempt in $(seq 1 60); do
-    if ssh -i "$KEY_PATH" "${SSH_COMMON_OPTS[@]}" "${LNMESH_USER}@${NODE_MESH_IP[$node]}" \
-      "lightning-cli --regtest listpeerchannels | jq -e --arg peer ${peer_id@Q} '.channels[]? | select(.peer_id == \$peer and .state == \"CHANNELD_NORMAL\")' >/dev/null"; then
+    status=0
+    ssh_key_raw "${NODE_MESH_IP[$node]}" "$cmd" "$SSH_SHORT_TIMEOUT" >/dev/null || status=$?
+    if ((status == 0)); then
       return 0
+    fi
+    if is_timeout_status "$status"; then
+      remote_command_failed "remote channel wait" "${NODE_MESH_IP[$node]}" "$SSH_SHORT_TIMEOUT" "$cmd" "$status"
     fi
     sleep 2
   done
@@ -784,12 +1125,16 @@ fund_wallets_and_open_channels() {
   local pi1_addr pi2_addr pi2_id pi3_id opened=0
 
   progress_all 92 "creating/loading miner wallet"
+  log "pi1 (${NODE_MESH_IP[pi1]}): creating/loading regtest miner wallet"
   ensure_miner_wallet
   progress_all 93 "mining regtest maturity blocks"
+  log "pi1 (${NODE_MESH_IP[pi1]}): mining 101 regtest maturity blocks"
   mine_blocks 101
 
   progress_node pi1 94 "creating CLN receive address"
   progress_node pi2 94 "creating CLN receive address"
+  log "pi1 (${NODE_MESH_IP[pi1]}): creating CLN receive address"
+  log "pi2 (${NODE_MESH_IP[pi2]}): creating CLN receive address"
   if [[ "$DRY_RUN" == "1" ]]; then
     pi1_addr="bcrt1dryrunpi1"
     pi2_addr="bcrt1dryrunpi2"
@@ -805,12 +1150,17 @@ fund_wallets_and_open_channels() {
 
   progress_node pi1 95 "funding CLN wallet"
   progress_node pi2 95 "funding CLN wallet"
+  log "pi1 (${NODE_MESH_IP[pi1]}): funding local CLN wallet"
   run_bash "bitcoin-cli -regtest -rpcwallet=miner sendtoaddress $(quote "$pi1_addr") 0.5 >/dev/null"
+  log "pi2 (${NODE_MESH_IP[pi2]}): funding CLN wallet from pi1 miner"
   run_bash "bitcoin-cli -regtest -rpcwallet=miner sendtoaddress $(quote "$pi2_addr") 0.5 >/dev/null"
+  log "pi1 (${NODE_MESH_IP[pi1]}): mining one block to confirm CLN wallet funding"
   mine_blocks 1
   [[ "$DRY_RUN" == "1" ]] || sleep 4
 
   progress_all 96 "collecting Lightning node IDs"
+  log "pi2 (${NODE_MESH_IP[pi2]}): reading Lightning node ID"
+  log "pi3 (${NODE_MESH_IP[pi3]}): reading Lightning node ID"
   if [[ "$DRY_RUN" == "1" ]]; then
     pi2_id="dryrun-pi2-node-id"
     pi3_id="dryrun-pi3-node-id"
@@ -825,10 +1175,13 @@ fund_wallets_and_open_channels() {
   fi
 
   progress_all 97 "connecting peers and opening channels"
+  log "pi1 (${NODE_MESH_IP[pi1]}): connecting to pi2 (${NODE_MESH_IP[pi2]})"
   run_bash "lightning-cli --regtest connect $(quote "${pi2_id}@${NODE_MESH_IP[pi2]}:9735") >/dev/null 2>&1 || true"
+  log "pi2 (${NODE_MESH_IP[pi2]}): connecting to pi3 (${NODE_MESH_IP[pi3]})"
   ssh_key "${NODE_MESH_IP[pi2]}" "lightning-cli --regtest connect $(quote "${pi3_id}@${NODE_MESH_IP[pi3]}:9735") >/dev/null 2>&1 || true"
 
   if ! channel_exists_local "$pi2_id"; then
+    log "pi1 (${NODE_MESH_IP[pi1]}): opening channel to pi2"
     run_bash "lightning-cli --regtest fundchannel id=$(quote "$pi2_id") amount=5000000 mindepth=1 >/dev/null"
     opened=1
   else
@@ -836,6 +1189,7 @@ fund_wallets_and_open_channels() {
   fi
 
   if ! channel_exists_remote pi2 "$pi3_id"; then
+    log "pi2 (${NODE_MESH_IP[pi2]}): opening channel to pi3"
     ssh_key "${NODE_MESH_IP[pi2]}" "lightning-cli --regtest fundchannel id=$(quote "$pi3_id") amount=5000000 mindepth=1 >/dev/null"
     opened=1
   else
@@ -844,13 +1198,16 @@ fund_wallets_and_open_channels() {
 
   if [[ "$opened" == "1" ]]; then
     progress_all 98 "confirming channel funding transactions"
+    log "pi1 (${NODE_MESH_IP[pi1]}): mining 6 blocks to confirm channel funding transactions"
     [[ "$DRY_RUN" == "1" ]] || sleep 6
     mine_blocks 6
     [[ "$DRY_RUN" == "1" ]] || sleep 6
   fi
 
   progress_all 99 "verifying CHANNELD_NORMAL"
+  log "pi1 (${NODE_MESH_IP[pi1]}): waiting for pi1 <-> pi2 CHANNELD_NORMAL"
   wait_channel_normal_local "$pi2_id" || die "pi1 <-> pi2 channel did not become CHANNELD_NORMAL"
+  log "pi2 (${NODE_MESH_IP[pi2]}): waiting for pi2 <-> pi3 CHANNELD_NORMAL"
   wait_channel_normal_remote pi2 "$pi3_id" || die "pi2 <-> pi3 channel did not become CHANNELD_NORMAL"
 }
 
@@ -895,10 +1252,12 @@ main() {
   start_mesh
   verify_passwordless_sudo_over_mesh
   configure_bridge
+  ensure_deferred_node_base_dependencies
   install_bitcoin_core
   install_core_lightning
   write_configs
   start_stack
+  validate_stack_ready
   fund_wallets_and_open_channels
   write_state_file
   summary
