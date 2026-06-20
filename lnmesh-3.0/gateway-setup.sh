@@ -260,6 +260,25 @@ scp_key() {
   fi
 }
 
+wait_parallel() {
+  local label="$1"
+  local status=0
+  local name pid
+  shift
+
+  while (($#)); do
+    name="$1"
+    pid="$2"
+    shift 2
+    if ! wait "$pid"; then
+      log "${label} failed for ${name}"
+      status=1
+    fi
+  done
+
+  ((status == 0)) || die "${label} failed"
+}
+
 remote_sudo_password() {
   local host="$1"
   local cmd="$2"
@@ -638,14 +657,21 @@ install_sudoers_on_node() {
 
 bootstrap_nodes() {
   local node
+  local jobs=()
   ensure_gateway_key
   progress_node pi1 15 "gateway SSH key ready"
   for node in pi2 pi3; do
     progress_node "$node" 12 "bootstrapping SSH and sudo"
     log "bootstrapping ${node} at ${NODE_WIFI_HOST[$node]}"
-    install_key_on_node "$node"
-    install_sudoers_on_node "$node"
-    ssh_key "${NODE_WIFI_HOST[$node]}" "sudo -n true"
+    (
+      install_key_on_node "$node"
+      install_sudoers_on_node "$node"
+      ssh_key "${NODE_WIFI_HOST[$node]}" "sudo -n true"
+    ) &
+    jobs+=("$node" "$!")
+  done
+  wait_parallel "node bootstrap" "${jobs[@]}"
+  for node in pi2 pi3; do
     progress_node "$node" 18 "SSH and passwordless sudo ready"
   done
 }
@@ -665,6 +691,8 @@ remote_base_dependencies_ready() {
 
 install_node_base_dependencies() {
   local node
+  local jobs=()
+  local installing_nodes=()
   for node in pi2 pi3; do
     if [[ "${NODE_ON_MESH[$node]}" == "1" ]]; then
       log "${node} is already on mesh; deferring base package check until pi1 bridge is configured"
@@ -678,7 +706,16 @@ install_node_base_dependencies() {
       continue
     fi
     progress_node "$node" 20 "downloading base mesh packages"
-    remote_sudo_key "${NODE_WIFI_HOST[$node]}" "apt-get update && apt-get install -y iw rfkill wget curl tar jq"
+    (
+      remote_sudo_key "${NODE_WIFI_HOST[$node]}" "apt-get update && apt-get install -y iw rfkill wget curl tar jq"
+    ) &
+    jobs+=("$node" "$!")
+    installing_nodes+=("$node")
+  done
+  if [[ "${#jobs[@]}" -gt 0 ]]; then
+    wait_parallel "base package install" "${jobs[@]}"
+  fi
+  for node in "${installing_nodes[@]}"; do
     NODE_BASE_DEPS_READY["$node"]=1
     progress_node "$node" 25 "base mesh packages ready"
   done
@@ -686,6 +723,8 @@ install_node_base_dependencies() {
 
 ensure_deferred_node_base_dependencies() {
   local node
+  local jobs=()
+  local installing_nodes=()
   for node in pi2 pi3; do
     if [[ "${NODE_BASE_DEPS_READY[$node]}" == "1" ]]; then
       continue
@@ -697,13 +736,23 @@ ensure_deferred_node_base_dependencies() {
       continue
     fi
     progress_node "$node" 41 "checking/installing base packages over mesh"
-    remote_sudo_key "${NODE_MESH_IP[$node]}" "apt-get update && apt-get install -y iw rfkill wget curl tar jq"
+    (
+      remote_sudo_key "${NODE_MESH_IP[$node]}" "apt-get update && apt-get install -y iw rfkill wget curl tar jq"
+    ) &
+    jobs+=("$node" "$!")
+    installing_nodes+=("$node")
+  done
+  if [[ "${#jobs[@]}" -gt 0 ]]; then
+    wait_parallel "deferred base package install" "${jobs[@]}"
+  fi
+  for node in "${installing_nodes[@]}"; do
     NODE_BASE_DEPS_READY["$node"]=1
     progress_node "$node" 42 "base mesh packages ready"
   done
 }
 
 verify_passwordless_sudo_over_mesh() {
+  local jobs=()
   progress_all 36 "verifying passwordless sudo over mesh"
   if [[ "$DRY_RUN" == "1" ]]; then
     log "+ sudo -n true on pi1, pi2, pi3"
@@ -711,19 +760,27 @@ verify_passwordless_sudo_over_mesh() {
   fi
 
   sudo -n true >/dev/null 2>&1 || die "passwordless sudo is not working on pi1"
-  ssh_key "${NODE_MESH_IP[pi2]}" "sudo -n true" || die "passwordless sudo is not working on pi2"
-  ssh_key "${NODE_MESH_IP[pi3]}" "sudo -n true" || die "passwordless sudo is not working on pi3"
+  ( ssh_key "${NODE_MESH_IP[pi2]}" "sudo -n true" ) &
+  jobs+=("pi2" "$!")
+  ( ssh_key "${NODE_MESH_IP[pi3]}" "sudo -n true" ) &
+  jobs+=("pi3" "$!")
+  wait_parallel "passwordless sudo verification" "${jobs[@]}"
   progress_all 37 "passwordless sudo verified"
 }
 
 copy_mesh_script_to_nodes() {
   local node host
+  local jobs=()
   for node in pi2 pi3; do
     host="${NODE_WIFI_HOST[$node]}"
-    ssh_key "$host" "mkdir -p /home/${LNMESH_USER}/lnmesh"
-    scp_key "${SCRIPT_DIR}/mesh-up.sh" "${LNMESH_USER}@${host}:/home/${LNMESH_USER}/lnmesh/mesh-up.sh"
-    ssh_key "$host" "chmod +x /home/${LNMESH_USER}/lnmesh/mesh-up.sh"
+    (
+      ssh_key "$host" "mkdir -p /home/${LNMESH_USER}/lnmesh"
+      scp_key "${SCRIPT_DIR}/mesh-up.sh" "${LNMESH_USER}@${host}:/home/${LNMESH_USER}/lnmesh/mesh-up.sh"
+      ssh_key "$host" "chmod +x /home/${LNMESH_USER}/lnmesh/mesh-up.sh"
+    ) &
+    jobs+=("$node" "$!")
   done
+  wait_parallel "mesh script copy" "${jobs[@]}"
 }
 
 local_mesh_ready() {
@@ -732,6 +789,7 @@ local_mesh_ready() {
 
 start_mesh() {
   local node host unit
+  local jobs=()
 
   copy_mesh_script_to_nodes
 
@@ -744,8 +802,14 @@ start_mesh() {
     host="${NODE_WIFI_HOST[$node]}"
     unit="lnmesh-mesh-${node}-$(date +%s)"
     progress_node "$node" 30 "switching wlan0 to IBSS mesh"
-    remote_sudo_key "$host" "systemd-run --no-block --unit=${unit} bash /home/${LNMESH_USER}/lnmesh/mesh-up.sh ${NODE_MESH_CIDR[$node]}"
+    (
+      remote_sudo_key "$host" "systemd-run --no-block --unit=${unit} bash /home/${LNMESH_USER}/lnmesh/mesh-up.sh ${NODE_MESH_CIDR[$node]}"
+    ) &
+    jobs+=("$node" "$!")
   done
+  if [[ "${#jobs[@]}" -gt 0 ]]; then
+    wait_parallel "remote mesh start" "${jobs[@]}"
+  fi
 
   if [[ "$DRY_RUN" == "0" ]] && local_mesh_ready; then
     log "pi1 already has mesh IP ${NODE_MESH_CIDR[pi1]}; not re-running mesh-up locally"
@@ -754,10 +818,14 @@ start_mesh() {
     progress_node pi1 30 "switching wlan0 to IBSS mesh"
     run_sudo_bash "bash $(quote "${SCRIPT_DIR}/mesh-up.sh") ${NODE_MESH_CIDR[pi1]}"
   fi
-  wait_for_mesh_node pi2
+  jobs=()
+  ( wait_for_mesh_node pi2 ) &
+  jobs+=("pi2" "$!")
+  ( wait_for_mesh_node pi3 ) &
+  jobs+=("pi3" "$!")
+  wait_parallel "mesh reachability check" "${jobs[@]}"
   NODE_ON_MESH[pi2]=1
   progress_node pi2 35 "mesh reachable at ${NODE_MESH_IP[pi2]}"
-  wait_for_mesh_node pi3
   NODE_ON_MESH[pi3]=1
   progress_node pi3 35 "mesh reachable at ${NODE_MESH_IP[pi3]}"
   progress_node pi1 35 "mesh IP ${NODE_MESH_IP[pi1]} ready"
@@ -785,14 +853,22 @@ wait_for_mesh_node() {
 }
 
 configure_bridge() {
+  local jobs=()
   progress_all 38 "configuring pi1 internet bridge"
   run_sudo_bash "sysctl -w net.ipv4.ip_forward=1"
   run_sudo_bash "nft list table ip nat >/dev/null 2>&1 || nft add table ip nat"
   run_sudo_bash "nft list chain ip nat postrouting >/dev/null 2>&1 || nft 'add chain ip nat postrouting { type nat hook postrouting priority 100; }'"
   run_sudo_bash "nft list chain ip nat postrouting 2>/dev/null | grep -Fq 'oifname \"${UPLINK_IFACE}\" masquerade' || nft add rule ip nat postrouting oifname ${UPLINK_IFACE} masquerade"
 
-  remote_sudo_key "${NODE_MESH_IP[pi2]}" "ip route replace default via ${NODE_MESH_IP[pi1]} dev wlan0 metric 100 && rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf"
-  remote_sudo_key "${NODE_MESH_IP[pi3]}" "ip route replace default via ${NODE_MESH_IP[pi1]} dev wlan0 metric 100 && rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf"
+  (
+    remote_sudo_key "${NODE_MESH_IP[pi2]}" "ip route replace default via ${NODE_MESH_IP[pi1]} dev wlan0 metric 100 && rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf"
+  ) &
+  jobs+=("pi2" "$!")
+  (
+    remote_sudo_key "${NODE_MESH_IP[pi3]}" "ip route replace default via ${NODE_MESH_IP[pi1]} dev wlan0 metric 100 && rm -f /etc/resolv.conf && printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf"
+  ) &
+  jobs+=("pi3" "$!")
+  wait_parallel "bridge route configuration" "${jobs[@]}"
   progress_all 40 "internet bridge ready"
 }
 
@@ -804,22 +880,92 @@ if command -v bitcoind >/dev/null 2>&1 && bitcoind -version 2>/dev/null | grep -
 fi
 cd /tmp
 archive=bitcoin-31.0-aarch64-linux-gnu.tar.gz
-wget -c --progress=bar:force:noscroll "https://bitcoincore.org/bin/bitcoin-core-31.0/${archive}"
+if [[ ! -s "$archive" ]]; then
+  wget -c --progress=bar:force:noscroll "https://bitcoincore.org/bin/bitcoin-core-31.0/${archive}"
+fi
 sudo -n tar -xzf "$archive" -C /opt/
 sudo -n ln -sf /opt/bitcoin-31.0/bin/bitcoind /usr/local/bin/
 sudo -n ln -sf /opt/bitcoin-31.0/bin/bitcoin-cli /usr/local/bin/
 EOF
 }
 
+bitcoin_archive_cmd() {
+  cat <<'EOF'
+set -e
+cd /tmp
+archive=bitcoin-31.0-aarch64-linux-gnu.tar.gz
+if [[ ! -s "$archive" ]]; then
+  wget -c --progress=bar:force:noscroll "https://bitcoincore.org/bin/bitcoin-core-31.0/${archive}"
+fi
+EOF
+}
+
+bitcoin_install_from_archive_cmd() {
+  cat <<'EOF'
+set -e
+if command -v bitcoind >/dev/null 2>&1 && bitcoind -version 2>/dev/null | grep -q 'v31.0'; then
+  exit 0
+fi
+archive=/tmp/bitcoin-31.0-aarch64-linux-gnu.tar.gz
+test -s "$archive"
+sudo -n tar -xzf "$archive" -C /opt/
+sudo -n ln -sf /opt/bitcoin-31.0/bin/bitcoind /usr/local/bin/
+sudo -n ln -sf /opt/bitcoin-31.0/bin/bitcoin-cli /usr/local/bin/
+EOF
+}
+
+bitcoin_installed_node() {
+  local node="$1"
+  local cmd status=0
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    return 1
+  fi
+
+  cmd="command -v bitcoind >/dev/null 2>&1 && bitcoind -version 2>/dev/null | grep -q 'v31.0'"
+  if [[ "$node" == "pi1" ]]; then
+    bash -lc "$cmd" >/dev/null 2>&1 || status=$?
+  else
+    ssh_key_raw "${NODE_MESH_IP[$node]}" "$cmd" "$SSH_SHORT_TIMEOUT" >/dev/null 2>&1 || status=$?
+  fi
+  ((status == 0))
+}
+
 install_bitcoin_core() {
-  local cmd node
+  local cmd node install_cmd
+  local jobs=()
+  local installing_nodes=()
   cmd="$(bitcoin_install_cmd)"
   progress_node pi1 44 "downloading/installing Bitcoin Core 31.0"
   run_bash "$cmd"
   progress_node pi1 55 "Bitcoin Core ready"
+
+  install_cmd="$(bitcoin_install_from_archive_cmd)"
   for node in pi2 pi3; do
-    progress_node "$node" 44 "downloading/installing Bitcoin Core 31.0"
-    ssh_key "${NODE_MESH_IP[$node]}" "$cmd"
+    if bitcoin_installed_node "$node"; then
+      log "${node} Bitcoin Core 31.0 is already installed"
+      progress_node "$node" 55 "Bitcoin Core ready"
+      continue
+    fi
+    progress_node "$node" 44 "copying/installing Bitcoin Core 31.0"
+    installing_nodes+=("$node")
+  done
+
+  if [[ "${#installing_nodes[@]}" -gt 0 ]]; then
+    run_bash "$(bitcoin_archive_cmd)"
+  fi
+
+  for node in "${installing_nodes[@]}"; do
+    (
+      scp_key "/tmp/bitcoin-31.0-aarch64-linux-gnu.tar.gz" "${LNMESH_USER}@${NODE_MESH_IP[$node]}:/tmp/bitcoin-31.0-aarch64-linux-gnu.tar.gz"
+      ssh_key "${NODE_MESH_IP[$node]}" "$install_cmd"
+    ) &
+    jobs+=("$node" "$!")
+  done
+  if [[ "${#jobs[@]}" -gt 0 ]]; then
+    wait_parallel "Bitcoin Core install" "${jobs[@]}"
+  fi
+  for node in "${installing_nodes[@]}"; do
     progress_node "$node" 55 "Bitcoin Core ready"
   done
 }
@@ -839,12 +985,12 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 if [[ ! -d "$HOME/cln/.git" ]]; then
-  git clone --progress --branch v26.04.1 https://github.com/ElementsProject/lightning.git "$HOME/cln"
+  git clone --progress --depth 1 --branch v26.04.1 https://github.com/ElementsProject/lightning.git "$HOME/cln"
 fi
 cd "$HOME/cln"
-git fetch --progress --tags origin v26.04.1 || true
+git fetch --progress --depth 1 origin tag v26.04.1 || git fetch --progress --depth 1 origin v26.04.1 || true
 git checkout v26.04.1
-git submodule update --init --recursive --progress
+git submodule update --init --recursive --depth 1 --progress
 uv sync --all-extras --all-groups --frozen
 source .venv/bin/activate
 ./configure --disable-rust
@@ -882,6 +1028,7 @@ cln_installed_node() {
 install_core_lightning() {
   local cmd node
   local nodes_needing_cln=()
+  local jobs=()
 
   if cln_installed_node pi1; then
     log "pi1 Core Lightning v26.04.1 is already installed"
@@ -901,9 +1048,17 @@ install_core_lightning() {
       continue
     fi
     progress_node "$node" 58 "downloading CLN runtime packages"
-    ssh_key "${NODE_MESH_IP[$node]}" "$cmd"
-    progress_node "$node" 62 "CLN runtime packages ready"
+    (
+      ssh_key "${NODE_MESH_IP[$node]}" "$cmd"
+    ) &
+    jobs+=("$node" "$!")
     nodes_needing_cln+=("$node")
+  done
+  if [[ "${#jobs[@]}" -gt 0 ]]; then
+    wait_parallel "CLN runtime package install" "${jobs[@]}"
+  fi
+  for node in "${nodes_needing_cln[@]}"; do
+    progress_node "$node" 62 "CLN runtime packages ready"
   done
 
   if [[ "${#nodes_needing_cln[@]}" -eq 0 ]]; then
@@ -912,10 +1067,17 @@ install_core_lightning() {
 
   progress_node pi1 78 "packing CLN binaries for nodes"
   run_sudo_bash "tar -cf /tmp/cln.tar -C / usr/local/bin/lightning-cli usr/local/bin/lightningd usr/local/bin/lightning-hsmtool usr/local/libexec/c-lightning && chmod a+r /tmp/cln.tar"
+  jobs=()
   for node in "${nodes_needing_cln[@]}"; do
     progress_node "$node" 70 "copying CLN binaries from pi1"
-    scp_key "/tmp/cln.tar" "${LNMESH_USER}@${NODE_MESH_IP[$node]}:/tmp/cln.tar"
-    remote_sudo_key "${NODE_MESH_IP[$node]}" "cd / && tar -xf /tmp/cln.tar"
+    (
+      scp_key "/tmp/cln.tar" "${LNMESH_USER}@${NODE_MESH_IP[$node]}:/tmp/cln.tar"
+      remote_sudo_key "${NODE_MESH_IP[$node]}" "cd / && tar -xf /tmp/cln.tar"
+    ) &
+    jobs+=("$node" "$!")
+  done
+  wait_parallel "CLN binary copy" "${jobs[@]}"
+  for node in "${nodes_needing_cln[@]}"; do
     progress_node "$node" 75 "Core Lightning ready"
   done
 }
@@ -932,6 +1094,7 @@ EOF
 
 write_configs() {
   local node tmp_cfg
+  local jobs=()
   tmp_cfg="$(mktemp)"
   make_lightning_config "$tmp_cfg"
 
@@ -941,10 +1104,14 @@ write_configs() {
   run cp "$tmp_cfg" "${HOME}/.lightning/config"
 
   for node in pi2 pi3; do
-    ssh_key "${NODE_MESH_IP[$node]}" "mkdir -p /home/${LNMESH_USER}/.bitcoin /home/${LNMESH_USER}/.lightning"
-    scp_key "${SCRIPT_DIR}/${NODE_BTC_CONF[$node]}" "${LNMESH_USER}@${NODE_MESH_IP[$node]}:/home/${LNMESH_USER}/.bitcoin/bitcoin.conf"
-    scp_key "$tmp_cfg" "${LNMESH_USER}@${NODE_MESH_IP[$node]}:/home/${LNMESH_USER}/.lightning/config"
+    (
+      ssh_key "${NODE_MESH_IP[$node]}" "mkdir -p /home/${LNMESH_USER}/.bitcoin /home/${LNMESH_USER}/.lightning"
+      scp_key "${SCRIPT_DIR}/${NODE_BTC_CONF[$node]}" "${LNMESH_USER}@${NODE_MESH_IP[$node]}:/home/${LNMESH_USER}/.bitcoin/bitcoin.conf"
+      scp_key "$tmp_cfg" "${LNMESH_USER}@${NODE_MESH_IP[$node]}:/home/${LNMESH_USER}/.lightning/config"
+    ) &
+    jobs+=("$node" "$!")
   done
+  wait_parallel "config copy" "${jobs[@]}"
 
   rm -f "$tmp_cfg"
   progress_all 82 "configs written"
@@ -1036,11 +1203,14 @@ start_stack_node() {
 }
 
 start_stack() {
-  start_stack_node pi1
-  log "moving daemon startup from pi1 to pi2"
-  start_stack_node pi2
-  log "moving daemon startup from pi2 to pi3"
-  start_stack_node pi3
+  local jobs=()
+  for node in pi1 pi2 pi3; do
+    (
+      start_stack_node "$node"
+    ) &
+    jobs+=("$node" "$!")
+  done
+  wait_parallel "daemon startup" "${jobs[@]}"
 }
 
 stack_ready_cmd() {

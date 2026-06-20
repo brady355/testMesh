@@ -231,12 +231,14 @@ LNMESH_SSH_TIMEOUT=5400 LNMESH_DAEMON_START_TIMEOUT=420 ./gateway-setup.sh --use
    - `pi2`: `10.0.0.2/24`
    - `pi3`: `10.0.0.3/24`
 9. Configures the temporary NAT bridge through `pi1`.
-10. Installs Bitcoin Core 31.0 on all Pis.
-11. Builds Core Lightning v26.04.1 on `pi1` and copies the binaries to `pi2`
-    and `pi3`.
+10. Downloads Bitcoin Core 31.0 on `pi1`, then copies and installs it on
+    `pi2` and `pi3` in parallel.
+11. Builds Core Lightning v26.04.1 on `pi1` from a shallow checkout and copies
+    the binaries to `pi2` and `pi3` in parallel.
 12. Writes Bitcoin and Lightning configs.
-13. Starts or recovers `bitcoind` and `lightningd` with detached stdio so
-    daemon children do not hold SSH sessions open.
+13. Starts or recovers `bitcoind` and `lightningd` on all three Pis in
+    parallel, with detached stdio so daemon children do not hold SSH sessions
+    open.
 14. Validates Bitcoin and Lightning RPC on `pi1`, `pi2`, and `pi3`.
 15. Creates or loads the regtest `miner` wallet on `pi1`.
 16. Mines maturity blocks.
