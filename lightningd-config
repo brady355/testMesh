@@ -1,4 +1,0 @@
-network=regtest
-bind-addr=0.0.0.0:9735
-log-level=info
-log-file=/home/brady/.lightning/lightningd.log
