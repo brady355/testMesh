@@ -1,4 +1,4 @@
-# LNMesh 2.0
+# LNMesh 3.0
 
 A 3-node testbed where Bitcoin Core and Core Lightning run over a wireless
 ad-hoc mesh. One Raspberry Pi has Ethernet/internet access; the other two reach
@@ -55,7 +55,7 @@ Run every setup command below on `pi1`.
 
 ```bash
 git clone https://github.com/brady355/testMesh.git
-cd testMesh/lnmesh-2.0
+cd testMesh/lnmesh-3.0
 chmod +x gateway-setup.sh pay-demo.sh
 ```
 
@@ -100,7 +100,7 @@ address and run the same `tail -f` command again.
 
 ### Step 7 - Run The Demo Payment
 
-After setup finishes, run this on `pi1` from the `lnmesh-2.0` directory:
+After setup finishes, run this on `pi1` from the `lnmesh-3.0` directory:
 
 ```bash
 ./pay-demo.sh
@@ -243,7 +243,7 @@ LNMESH_SSH_TIMEOUT=5400 LNMESH_DAEMON_START_TIMEOUT=420 ./gateway-setup.sh --use
 17. Funds CLN wallets and waits until the funding is confirmed.
 18. Opens the `pi1 <-> pi2` and `pi2 <-> pi3` Lightning channels.
 19. Waits until both channels are `CHANNELD_NORMAL`.
-20. Writes runtime state to `~/.lnmesh/lnmesh-2.0.env`.
+20. Writes runtime state to `~/.lnmesh/lnmesh-3.0.env`.
 
 When setup finishes, the network should already be at the pre-payment state.
 

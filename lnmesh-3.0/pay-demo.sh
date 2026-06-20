@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-STATE_FILE="${HOME}/.lnmesh/lnmesh-2.0.env"
+STATE_FILE="${HOME}/.lnmesh/lnmesh-3.0.env"
 
 LNMESH_USER="${USER:-brady}"
 LNMESH_KEY_PATH="${HOME}/.ssh/lnmesh_ed25519"

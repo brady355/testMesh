@@ -12,7 +12,7 @@ PASSWORD_FILE=""
 UPLINK_IFACE="${LNMESH_UPLINK_IFACE:-eth0}"
 KEY_PATH="${HOME}/.ssh/lnmesh_ed25519"
 STATE_DIR="${HOME}/.lnmesh"
-STATE_FILE="${STATE_DIR}/lnmesh-2.0.env"
+STATE_FILE="${STATE_DIR}/lnmesh-3.0.env"
 LOG_FILE="${STATE_DIR}/gateway-setup.log"
 PID_FILE="${STATE_DIR}/gateway-setup.pid"
 DEFAULT_PAYMENT_MSAT="${LNMESH_PAYMENT_MSAT:-1000000}"
@@ -49,7 +49,7 @@ usage() {
 Usage:
   ./gateway-setup.sh [--user brady] [--node-password PASSWORD] [--node pi2=HOST --node pi3=HOST] [--dry-run] [--foreground]
 
-Runs on pi1 from the lnmesh-2.0 directory. It discovers pi2/pi3 on normal
+Runs on pi1 from the lnmesh-3.0 directory. It discovers pi2/pi3 on normal
 Wi-Fi or resumes from their expected mesh IPs, moves the three Pis onto the
 IBSS mesh, installs Bitcoin Core/Core Lightning, starts regtest daemons, funds
 wallets, and opens the demo channels.
@@ -343,8 +343,8 @@ load_password_file() {
 validate_inputs() {
   [[ "$LNMESH_USER" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]] || die "unsafe username: $LNMESH_USER"
 
-  if [[ "$(basename "$SCRIPT_DIR")" != "lnmesh-2.0" ]]; then
-    log "warning: expected to run from lnmesh-2.0, script dir is ${SCRIPT_DIR}"
+  if [[ "$(basename "$SCRIPT_DIR")" != "lnmesh-3.0" ]]; then
+    log "warning: expected to run from lnmesh-3.0, script dir is ${SCRIPT_DIR}"
   fi
 
   if [[ "$DRY_RUN" == "0" && -z "$NODE_PASSWORD" ]]; then
@@ -1495,8 +1495,13 @@ fund_wallets_and_open_channels() {
 
   if ! channel_exists_local "$pi2_id"; then
     log "pi1 (${NODE_MESH_IP[pi1]}): opening channel to pi2"
-    pi1_channel_json="$(local_json "lightning-cli --regtest fundchannel id=$(quote "$pi2_id") amount=${CHANNEL_AMOUNT_SAT} mindepth=1")"
-    pi1_channel_txid="$(printf '%s\n' "$pi1_channel_json" | jq -r '.txid // empty')"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      local_json "lightning-cli --regtest fundchannel id=$(quote "$pi2_id") amount=${CHANNEL_AMOUNT_SAT} mindepth=1" >/dev/null
+      pi1_channel_txid="dryrun-pi1-pi2-channel-txid"
+    else
+      pi1_channel_json="$(local_json "lightning-cli --regtest fundchannel id=$(quote "$pi2_id") amount=${CHANNEL_AMOUNT_SAT} mindepth=1")"
+      pi1_channel_txid="$(printf '%s\n' "$pi1_channel_json" | jq -r '.txid // empty')"
+    fi
     opened=1
   else
     log "pi1 <-> pi2 channel already exists"
@@ -1509,8 +1514,13 @@ fund_wallets_and_open_channels() {
 
   if ! channel_exists_remote pi2 "$pi3_id"; then
     log "pi2 (${NODE_MESH_IP[pi2]}): opening channel to pi3"
-    pi2_channel_json="$(remote_json pi2 "lightning-cli --regtest fundchannel id=$(quote "$pi3_id") amount=${CHANNEL_AMOUNT_SAT} mindepth=1" "$SSH_TIMEOUT")"
-    pi2_channel_txid="$(printf '%s\n' "$pi2_channel_json" | jq -r '.txid // empty')"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      remote_json pi2 "lightning-cli --regtest fundchannel id=$(quote "$pi3_id") amount=${CHANNEL_AMOUNT_SAT} mindepth=1" "$SSH_TIMEOUT" >/dev/null
+      pi2_channel_txid="dryrun-pi2-pi3-channel-txid"
+    else
+      pi2_channel_json="$(remote_json pi2 "lightning-cli --regtest fundchannel id=$(quote "$pi3_id") amount=${CHANNEL_AMOUNT_SAT} mindepth=1" "$SSH_TIMEOUT")"
+      pi2_channel_txid="$(printf '%s\n' "$pi2_channel_json" | jq -r '.txid // empty')"
+    fi
     opened=1
   else
     log "pi2 <-> pi3 channel already exists"
